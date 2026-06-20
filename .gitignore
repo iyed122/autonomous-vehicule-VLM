@@ -1,0 +1,48 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# ---- Large datasets (NOT pushed — see docs/PUSH_TO_GITHUB.md) ----
+# nuScenes raw sensor data is hundreds of GB; keep it out of git.
+LIDAR_TOP/
+yolo_dataset/images/
+yolo_dataset/labels/
+*.pcd.bin
+
+# ---- Model weights are tracked via Git LFS (see .gitattributes) ----
+# If you are NOT using LFS, uncomment to keep them out of git entirely:
+# *.pt
+# *.pth
+
+# Duplicate of checkpoint_v3/ — never push this one.
+checkpoints/
+
+# ---- Runtime / generated output ----
+inference_outputs/
+runs/detect/
+runs/train/**/train_batch*.jpg
+runs/train/**/val_batch*.jpg
+visualizations/
+*_preview.png
+_*.py
+_*.png
+_*.pdf
+
+# ---- Heavy notebooks (embedded outputs bloat the repo) ----
+# Strip outputs before committing if you want to keep them:
+#   jupyter nbconvert --clear-output --inplace notebook.ipynb
+*.ipynb
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ---- Stock COCO weights (auto-downloads on first use; not our trained model) ----
+yolov8n.pt

@@ -1,0 +1,30 @@
+{
+  "scene_index": 26,
+  "frames": 8,
+  "dominant_risk": "BRAKE",
+  "scene_type": "urban-residential",
+  "summary": "The ego vehicle drives through a quiet urban street lined with parked cars, slows for a nearby vehicle in-lane, then finds the path ahead clearing. Main risk is the close in-lane vehicle.",
+  "hazards": [
+    "parked vehicles narrowing lane",
+    "in-lane vehicle at close range",
+    "pedestrian near curb"
+  ],
+  "commentary": [
+    {
+      "segment": 1,
+      "text": "Clear road opening up on the left; LiDAR shows free space ahead."
+    },
+    {
+      "segment": 2,
+      "text": "Pedestrian near the right curb \u2014 holding speed, ready to slow."
+    },
+    {
+      "segment": 3,
+      "text": "Intersection approaching, scanning cross-traffic on the side cameras."
+    },
+    {
+      "segment": 4,
+      "text": "Path ahead is clear; maintaining a steady cruise."
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+train: /home/ec2-user/SageMaker/yolo_dataset/images/train
+val: /home/ec2-user/SageMaker/yolo_dataset/images/val
+nc: 1
+names: ['object']

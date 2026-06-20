@@ -1,0 +1,6 @@
+
+train: yolo_dataset/images/train
+val: yolo_dataset/images/train  # you can split later if needed
+
+nc: 1
+names: ['object']

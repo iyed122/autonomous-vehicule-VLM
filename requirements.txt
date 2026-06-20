@@ -1,0 +1,22 @@
+# Requirements for this project (inferred from imports)
+# NOTE: Install `torch` according to your CUDA/CPU setup as described below
+numpy
+tqdm
+torch
+torchvision
+Pillow
+opencv-python
+matplotlib
+scipy
+pyyaml
+scikit-learn
+pandas
+ultralytics
+streamlit
+
+# If you have an NVIDIA GPU, install torch with CUDA support following
+# https://pytorch.org/get-started/locally/ instead of the plain `torch` above.
+# ---- VLM reasoning layer (optional) ----
+# Talks to a local Ollama server (https://ollama.com). Pull a VISION model:
+#   ollama pull qwen2.5vl:7b
+requests

@@ -1,0 +1,5 @@
+train: /home/ec2-user/SageMaker/yolo_dataset/images/train
+val: /home/ec2-user/SageMaker/yolo_dataset/images/val
+
+nc: 6
+names: ["car", "truck", "pedestrian", "bus", "motorcycle", "barrier"]
