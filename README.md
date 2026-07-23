@@ -4,7 +4,7 @@
 ![PyTorch](https://img.shields.io/badge/PyTorch-YOLOv8%20%2B%20BEV-ee4c2c)
 ![Dataset](https://img.shields.io/badge/Dataset-nuScenes-success)
 ![Cloud](https://img.shields.io/badge/Trained%20on-AWS%20SageMaker-orange)
-![VLM](https://img.shields.io/badge/VLM-Ollama%20%C2%B7%20Qwen3.5-7b3fbf)
+![VLM](https://img.shields.io/badge/VLM-Qwen2.5--VL%20%C2%B7%20Ollama-7b3fbf)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
 > A two-stage self-driving perception stack that **sees the road, predicts where the car is going, and decides whether to brake** — trained on the nuScenes dataset on AWS SageMaker, and packaged as an interactive demo you can run locally.
@@ -18,9 +18,7 @@
 
 ## ▶️ Demo
 
-**Full video walkthrough:** [Watch on YouTube](https://youtu.be/REPLACE_WITH_VIDEO_ID)  ·  _(narrated tour of all four tabs: detection, trajectory, scene dashboard, and the VLM co-pilot with spoken instructions)_
-
-[![Watch the demo](https://img.shields.io/badge/▶%20Watch%20the%202-min%20demo-red?style=for-the-badge&logo=youtube)](https://youtu.be/REPLACE_WITH_VIDEO_ID)
+The three GIFs above are the live collision-risk monitor. The panels below are captured from the Streamlit app; the narrated scene clips live in [`demo/scenes/`](demo/scenes/).
 
 ### Screenshots
 
