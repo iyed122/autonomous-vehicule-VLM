@@ -46,3 +46,7 @@ Thumbs.db
 
 # ---- Stock COCO weights (auto-downloads on first use; not our trained model) ----
 yolov8n.pt
+
+# Private interview preparation - never publish
+Interview_Defense_Dossier.*
+docs/Interview_Defense_Dossier.*

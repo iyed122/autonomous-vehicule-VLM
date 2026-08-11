@@ -41,7 +41,6 @@ Forward-collision warning and automatic emergency braking sit at the core of eve
 The result runs three ways: a live **Streamlit demo**, a **collision-risk video monitor** over a driving scene, and a per-scene **PDF safety report**.
 
 📄 **Full technical write-up:** [`Technical_Report.pdf`](Technical_Report.pdf) — architecture, algorithms, math, and business analysis in depth.
-📘 **Interview / defense prep:** [`Interview_Defense_Dossier.pdf`](Interview_Defense_Dossier.pdf) — deep-dive + mock Q&A (easy/medium/hard) with answers.
 🎬 **Demo walkthrough:** see [`demo/`](demo/) (narrated screen recording of the app).
 
 ---
