@@ -9,10 +9,11 @@ date: "Technical Report"
 This report documents an end-to-end autonomous-driving perception and motion-planning
 system built on the [nuScenes](https://www.nuscenes.org/) dataset and trained on AWS
 SageMaker. It combines a **YOLOv8 camera object detector**, a **custom bird's-eye-view
-(BEV) multi-modal trajectory planner** operating on LiDAR, and a **collision-risk fusion
-layer** that checks the predicted path against the LiDAR obstacle map and returns an
-actionable CLEAR / CAUTION / BRAKE decision with distance-to-obstacle and time-to-obstacle
-(TTC). The system is delivered as an interactive Streamlit application, a risk-monitor video
+(BEV) multi-modal trajectory planner** operating on LiDAR (planner v4: the encoder trained at
+scale plus heads that see the car's measured motion, cross-validated against physics baselines),
+and a **collision-risk fusion layer** that checks the predicted path against the LiDAR obstacle map
+and returns an actionable CLEAR / CAUTION / BRAKE decision with distance-to-obstacle and
+time-to-obstacle (TTC). The system is delivered as an interactive Streamlit application, a risk-monitor video
 generator, a per-scene PDF safety report, and a fleet review that scores every recorded scene
 and queues the moments worth a human look. This document covers the data pipeline, both model
 architectures, the fusion algorithm, the camera–LiDAR synchronisation, the engineering
@@ -238,37 +239,37 @@ Cells inside the car's own footprint (rear bumper -0.9 m to front bumper +3.4 m,
 sideways) are removed, because the roof LiDAR also sees the vehicle itself.
 
 ## 8.3 Which path is scanned, and the corridor scan
-By default the scanned path is the **lane along the car's current heading**, as long as the
-distance the car covers in 5.5 s at its measured speed (never shorter than the CAUTION range).
-The learned planner's path can be scanned instead (`--path model`), but section 8.7 shows why
-it is not the default at the epoch-5 checkpoint.
+By default the scanned path is **planner v4's most likely path** (section 8.7), extended along its
+last direction until it covers at least the CAUTION range. When the car's motion could not be
+measured (the first frames of a scene, or a weak scan registration), the fallback is the lane along
+the current heading, as long as the distance covered in 5.5 s. `--path heading` forces the
+fallback everywhere.
 
-The path, prefixed with the car's own position (a learned path's first waypoint is already
-0.5 s ahead), is resampled by arc length and walked outward from the front bumper. At each
-point a ±1.0 m window (±5 cells, the car's half-width plus a margin) is tested against the
-obstacle map. The first hit gives the **gap from the front bumper**, `d`.
+The path, prefixed with the car's own position (the first waypoint is already 0.5 s ahead), is
+resampled by arc length and walked outward from the front bumper. At each point a ±1.0 m window
+(±5 cells, the car's half-width plus a margin) is tested against the obstacle map. On a hit, the
+distance is measured to the obstacle cells themselves, giving the **gap from the front bumper**, `d`.
 
 ```
 for point (x, y) along the path, from the car outward:
     if x < 3.4 m: continue                                 # still inside the car
     if any obstacle cell within ±1 m of (x, y) in the raster:
-        d = hypot(x, y) - 3.4 m; break
+        d = min over those cells of hypot(cx, cy) - 3.4 m; break
 ```
 
 ## 8.4 Speed, TTC and decision
-**Speed is measured, not predicted** (`lidar_odometry`): the two consecutive scans are reduced
-to occupancy grids of static structure (dense cells at least 0.3 m above the road) and
-cross-correlated with an FFT. The correlation peak is how far the world shifted in 0.5 s, i.e.
-how far the car moved. A weak peak (normalised correlation below 0.15) returns no speed.
-Translation-only alignment is accurate for short gaps; it does not model rotation.
+**Motion is measured, not predicted** (`odometry_labels.register`). Returns 0.3–3 m above the road
+are taken from two consecutive scans, in the ego frame. The later scan is rotated through a yaw search
+(±8° in 0.5° steps, scored on a coarse 0.4 m grid), then the shift is found at full 0.2 m resolution
+from the FFT cross-correlation of the two occupancy grids. The result is how far the car moved
+forward and sideways and how much it turned in 0.5 s. The same filtering as in training (a median
+over the last three steps) is applied before the motion is used. A weak peak (normalised
+correlation below 0.15) returns no motion.
 
 ```
 v = |shift| / 0.5 s
 TTC = d / v        (the car's own speed; obstacles treated as static)
 ```
-
-When a learned path is scanned without a measured speed, the fallback is the path length over
-the 5.5 s it spans (`PRED_HORIZON_S`).
 
 Decision thresholds on the gap from the front bumper: `d < 5 m → BRAKE`,
 `5 ≤ d < 15 m → CAUTION`, else `CLEAR`. For scores and review, a frame where the car is
@@ -294,34 +295,68 @@ matrices (section 9).
    which let obstacles between 3 m and the bumper count as "in the car". Distances are now
    gaps from the front bumper, the car's own footprint is masked, and the thresholds were
    restated accordingly (5 m / 15 m from the bumper ≈ the old 8 m / 20 m from the axle).
-5. **Path and speed.** The decision used to follow the learned path and the speed implied by
-   it. After 8.7 it follows the measured heading at the LiDAR-measured speed, and stopped or
-   crawling frames no longer count as close calls.
+5. **Path and speed.** Speed used to be implied by the epoch-5 planner's path. It is now measured
+   by scan registration, the path comes from planner v4 (8.7), and stopped or crawling frames no
+   longer count as close calls.
 
 ## 8.6 Validation
-On all 3,376 key-frames the corrected layer gives 1% BRAKE, 19% CAUTION and 81% CLEAR (stopped or crawling frames counted as CLEAR), with a median gap of 10.8 m when something is in the lane. Rendered frames were checked by eye: road edges run parallel to the lane and BRAKE hits sit ahead of the car. The thresholds are fixed distances; nuScenes has no crash or near-miss labels, so they are not tuned or validated against outcomes.
+On all 3,376 key-frames, with planner v4 choosing the path, the layer gives 1% BRAKE, 23% CAUTION and
+77% CLEAR (stopped or crawling frames, 31% of the drive, counted as CLEAR), with a median gap of 10.9 m
+when something is in the path: plausible for dense urban driving where the car often follows
+traffic. Rendered frames were checked by eye: road edges run parallel to the predicted path, which
+bends with the road in turns, and BRAKE hits sit ahead of the car. The thresholds are fixed distances;
+nuScenes has no crash or near-miss labels, so they are not tuned or validated against outcomes.
 
-## 8.7 Is the learned path good enough to drive the check? (`planner_eval.py`)
-The local data has no ego poses, so the car's real motion is recovered from the LiDAR: scans
-1 s apart are aligned (8.4) and the shifts chained to 3 s ahead. Frames with weak alignment or
-an almost stopped car are skipped. The planner's position at 3 s is interpolated from its
-waypoints and compared with the real one.
+## 8.7 Planner v4: the trained encoder plus measured motion (`motion_planner.py`)
+**Why a v4.** Tested against the car's real motion, the epoch-5 planner was worse than simply
+assuming the car keeps its heading. Two causes in the original design and training code:
 
-| 3 s ahead | mean absolute error |
+1. It sees a single LiDAR scan, from which the car's speed cannot be known, so its forward distance
+   was badly off.
+2. The BEV tensor is `(channels, sensor x, sensor y)`, i.e. `(lateral, forward)`, and the "mirror left
+   and right" augmentation used `TF.hflip`, which flips the **last** axis, the forward one. Half of the
+   training samples paired a scene mirrored front-to-back with a target path mirrored left-to-right,
+   which teaches an inconsistent sideways direction. (Fixed in the script: `TF.vflip`.)
+
+**Labels without poses (`odometry_labels.py`).** The local data has no ego poses, so the car's real
+path is recovered from the LiDAR: every consecutive pair of scans is registered (yaw search, then an
+FFT shift, section 8.4), each 0.5 s step is median-filtered against its neighbours to remove the
+occasional misfire, and 12 steps are chained into the positions 0.5 s to 6.0 s ahead, resampled to the
+same 20 waypoints the planner was trained on. Frames whose registrations are weak are left out:
+1,945 of the 3,376 key-frames have clean labels.
+
+**Model.** The BEV encoder trained on ~200 GB of nuScenes on AWS SageMaker is kept as is; its 256-d
+scene embedding is computed once per frame (and once on the correctly mirrored raster). New heads
+(two 256-unit layers, dropout 0.3) take the embedding plus five motion features (forward speed,
+sideways speed, yaw rate, and the change in forward speed and yaw rate over the last 0.5 s) and predict
+three candidate paths as corrections to a constant-turn-rate-and-velocity extrapolation, plus a
+probability for each. Loss: winner-takes-all Huber, mode cross-entropy on logits (label smoothing 0.1),
+and a small diversity hinge. AdamW, weight decay 1e-2, 40 epochs. Five heads trained from different
+seeds are averaged (the most likely path of each); the three candidate paths come from the first.
+
+**Evaluation.** 5-fold cross-validation split by scene: no frame of a test drive is seen in training.
+Every method is scored against the same labels.
+
+| Method (5-fold, held-out scenes) | ADE | FDE | sideways error at 3 s |
+|---|---|---|---|
+| Epoch-5 planner (one scan) | 18.65 m | 35.27 m | 1.23 m |
+| Keep heading, constant speed | 5.56 m | 11.95 m | 0.69 m |
+| Constant acceleration | 6.33 m | 14.71 m | 0.69 m |
+| Constant turn rate and speed (CTRV) | 5.69 m | 12.46 m | 0.78 m |
+| Planner v4 (this work) | 5.26 m | 11.15 m | 0.60 m |
+| Three candidate paths (best of 3, minADE@3) | ADE |
 |---|---|
-| Sideways, learned planner (epoch 5) | 0.91 m |
-| Sideways, 'keeps its heading' baseline | 0.10 m |
-| Forward distance, learned planner | 17.3 m (real median 12.8 m, planner median 30.7 m) |
+| Physics, 3 speeds (slower / same / faster) | 3.99 m |
+| Planner v4, its 3 paths | 2.94 m |
 
-The sideways prediction is worse than simply assuming the car keeps its heading, and barely
-correlated with the real motion. Root cause, found in `train_trajectory_v3.py`: the BEV tensor
-is `(channels, sensor x, sensor y)`, i.e. `(lateral, forward)`, and the "mirror left and right"
-augmentation used `TF.hflip`, which flips the **last** axis, the forward one. Half of the
-training samples therefore paired a scene mirrored front-to-back with a target path mirrored
-left-to-right, which teaches an inconsistent sideways direction. The rotation augmentation is
-consistent (a counter-clockwise image rotation is a positive yaw in the ego frame). Fix for the
-next run: `TF.vflip` (the lateral axis), then re-run `planner_eval.py` and switch the risk check
-to the learned path only once it beats the heading baseline.
+Planner v4 beats every physics baseline on every measure: 5% lower average error, 7% lower final
+error and 13% lower sideways error than the best one. Its three candidate paths reach a best-of-3
+error of 2.94 m against 3.99 m for three physics hypotheses (slower / same / faster speed, with the
+factors tuned on the training drives), 26% lower. It is 72% more accurate than the epoch-5 planner.
+
+**Limits.** The labels come from translation-plus-yaw registration, not from the vehicle's poses, so
+they carry some noise (scans dominated by moving traffic align less well, and are filtered out). The
+numbers compare methods on equal terms; they are not nuScenes benchmark scores.
 
 # 9. Camera–LiDAR synchronisation (`scene_dashboard.py`)
 
@@ -420,18 +455,21 @@ model and synchronised cameras to produce meaningful narration.
 
 ## 11.1 The business question: which moments should a safety manager watch?
 A fleet or an insurer cannot watch every hour of recorded driving. `fleet_review.py` runs the
-whole recording through the planner and the risk layer and turns it into a review queue.
+whole recording through planner v4 and the risk layer and turns it into a review queue.
 
 Run on all 3,376 local key-frames (28 minutes, 68 scenes, Boston and Singapore):
 
-- Time at each level, counting stopped or crawling frames as CLEAR: CLEAR 22.8 min, CAUTION 5.2 min, BRAKE 0.2 min. The car was stopped or under 7 km/h in 44% of the frames with a measured speed.
-- 9 close calls (BRAKE while moving) in 6 scenes. Watching each one with up to 2 s of lead-in takes 0.6 minutes, 2% of the recording.
-- Each scene gets the `safety_report.py` score; events are ranked by the smallest gap. With `--notes qwen3:8b`, a local language model writes a one-line note and a "what to check" line per top event from the measured numbers only.
+- Time at each level, counting stopped or crawling frames as CLEAR: CLEAR 21.6 min, CAUTION 6.4 min,
+  BRAKE 0.2 min.
+- 10 close calls (BRAKE while moving) in 6 scenes. Watching each one with up to 2 s of lead-in takes
+  0.8 minutes, 3% of the recording.
+- Each scene gets the `safety_report.py` score; events are ranked by the smallest gap. With
+  `--notes qwen3:8b`, a local language model writes a one-line note and a "what to check" line per
+  top event from the measured numbers only.
 
-Caveats: TTC uses the car's own speed and treats obstacles as static, so following a car closely reads as a close call (which is also what a driver coach wants to see); the lane follows the current heading, so obstacles in a turn can be missed.
-
-All inference runs on a laptop CPU against bundled sample frames; the heavy training ran on
-SageMaker. Trained weights are versioned with Git LFS.
+Caveats: TTC uses the car's own speed and treats obstacles as static, so following a car closely
+reads as a close call (which is also what a driver coach wants to see); the predicted path comes from
+one scan plus the measured motion, so it can be wrong in a sharp turn.
 
 # 12. Engineering practices
 
@@ -446,8 +484,9 @@ SageMaker. Trained weights are versioned with Git LFS.
 
 # 13. Limitations and future work
 
-1. **Planner maturity** — epoch-5 checkpoint; resuming training with the v3 augmentation /
-   diversity recipe is the highest-leverage next step (lower FDE, real turn commitment).
+1. **Planner** — v4 trains new heads on a frozen epoch-5 encoder. Retraining the whole network
+   end to end with the fixes in 6.3 and the measured motion as an input would lower the error
+   further; labels from vehicle poses would remove the registration noise.
 2. **Detector** — single-class, CPU-trained, still improving at epoch 20; multi-class GPU
    training would raise mAP and enable typed hazards end-to-end.
 3. **Cross-sensor fusion** — risk currently uses the LiDAR obstacle map only; with
@@ -456,8 +495,9 @@ SageMaker. Trained weights are versioned with Git LFS.
 5. **Validation of the risk layer** — thresholds are fixed distances; with labelled
    near-misses (or the ground-truth future path from nuScenes poses) the queue could be scored
    for precision and recall.
-6. **Speed** — estimated from the path predicted on a single LiDAR frame; using the measured
-   ego velocity (CAN bus / pose differences) would make TTC much more reliable.
+6. **Speed and TTC** — speed comes from scan registration (good over 0.5 s, weaker in heavy
+   traffic); TTC ignores the obstacle's own motion. Tracking obstacles over time would give the
+   closing speed.
 7. **Vision-language path** — see 10.4.
 
 # 14. Technology stack
@@ -479,8 +519,12 @@ SageMaker. Trained weights are versioned with Git LFS.
 | nuScenes raw dataset | ~200 GB |
 | YOLO training images | 20,256 |
 | Bundled LiDAR frames / scenes | 3,376 / 68 (28 min of driving) |
+| Planner v4 (5-fold CV) ADE / FDE / sideways at 3 s | 5.26 m / 11.15 m / 0.60 m |
+| Best physics baseline ADE / FDE / sideways at 3 s | 5.56 m / 11.95 m / 0.69 m |
+| Planner v4 best of 3 paths vs 3 physics guesses | 2.94 m vs 3.99 m |
+| Review queue | 10 close calls, 0.8 of 28 min (3%) |
 | BEV raster | 500 × 500 × 3 |
 | Planner parameters / tensors | ~12M / 130 |
 | Trajectory modes / horizon | 3 / 20 waypoints spanning 5.5 s |
 | YOLO mAP@0.50 / @0.50–0.95 | 0.35 / 0.21 |
-| Planner val ADE / FDE | 3.29 m / 7.23 m |
+| Epoch-5 planner val ADE / FDE (training split) | 3.29 m / 7.23 m |

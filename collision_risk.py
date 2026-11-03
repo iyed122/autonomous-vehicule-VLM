@@ -164,7 +164,7 @@ def assess_risk(path_xy: np.ndarray,
                   or heading_corridor().
         bev     : (H, W, 3) BEV raster from create_bev_representation.
         horizon_s: time the waypoints span, for the path-based speed estimate.
-        speed_mps: measured speed (e.g. lidar_odometry); if given, it replaces the
+        speed_mps: measured speed (odometry_labels.register); if given, it replaces the
                   path-based estimate for TTC.
     """
     occ = obstacle_map(bev, cfg)
@@ -230,50 +230,29 @@ def effective_level(level: str, speed_mps: Optional[float]) -> str:
     return level
 
 
+def extend_path(path_xy: np.ndarray, cfg: RiskConfig = RiskConfig()) -> np.ndarray:
+    """Extend a predicted path along its last direction until it covers at least the
+    CAUTION range ahead of the bumper (a slow car's 5.5 s path can be shorter)."""
+    path = np.asarray(path_xy, dtype=float)
+    reach = cfg.front_bumper_m + cfg.caution_dist_m + 1.0
+    end = path[-1]
+    if np.hypot(*end) >= reach:
+        return path
+    d = path[-1] - path[-4] if len(path) >= 4 else np.array([1.0, 0.0])
+    d = d / np.linalg.norm(d) if np.linalg.norm(d) > 0.05 else np.array([1.0, 0.0])
+    extra = [end + d * s for s in np.arange(1.0, reach + 1.0, 1.0)]
+    extra = [p for p in extra if np.hypot(*p) <= reach + 1.0]
+    return np.vstack([path] + ([np.array(extra)] if extra else []))
+
+
 def heading_corridor(speed_mps: Optional[float], cfg: RiskConfig = RiskConfig(),
                      horizon_s: float = PRED_HORIZON_S) -> np.ndarray:
     """The path along the car's current heading that the risk check scans: as far as the
     car travels in `horizon_s` at `speed_mps`, and never shorter than the CAUTION range.
-    Used instead of the learned path while the epoch-5 planner's sideways prediction is
-    worse than this baseline (see planner_eval.py)."""
+    Used when no planner is loaded, or for frames whose motion could not be measured."""
     reach = cfg.front_bumper_m + cfg.caution_dist_m + 1.0
     length = max(reach, (speed_mps or 0.0) * horizon_s + cfg.front_bumper_m)
     return straight_fallback_path(length, 20)
-
-
-def _registration_grid(bev: np.ndarray, cfg: RiskConfig = RiskConfig()) -> np.ndarray:
-    """Static-structure occupancy used to align two scans: dense cells 0.3 m+ above road."""
-    z_min, z_max = BEV_Z_RANGE
-    thresh = (0.3 - cfg.sensor_height_m - z_min) / (z_max - z_min)
-    return ((bev[:, :, 2] > cfg.density_thresh) & (bev[:, :, 0] > thresh)).astype(np.float32)
-
-
-def scan_motion(bev_prev: np.ndarray, bev_next: np.ndarray, cfg: RiskConfig = RiskConfig()):
-    """How far the car moved between two scans, in the ego frame of the first one.
-
-    Cross-correlates the two occupancy grids (FFT); the peak is the shift of the static
-    world between the scans, i.e. the car's own motion (translation only, so it is most
-    accurate over short gaps). Returns (forward_m, left_m, quality in [0, 1])."""
-    a, b = _registration_grid(bev_prev, cfg), _registration_grid(bev_next, cfg)
-    if a.sum() < 50 or b.sum() < 50:
-        return 0.0, 0.0, 0.0
-    corr = np.real(np.fft.ifft2(np.fft.fft2(a) * np.conj(np.fft.fft2(b))))
-    k0, k1 = np.unravel_index(int(np.argmax(corr)), corr.shape)
-    n0, n1 = corr.shape
-    d0 = ((k0 + n0 // 2) % n0 - n0 // 2) * cfg.resolution     # sensor x (right) shift
-    d1 = ((k1 + n1 // 2) % n1 - n1 // 2) * cfg.resolution     # sensor y (forward) shift
-    quality = float(corr.max() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-9))
-    return float(d1), float(-d0), quality
-
-
-def lidar_odometry(bev_prev: np.ndarray, bev_next: np.ndarray, dt_s: float,
-                   cfg: RiskConfig = RiskConfig(), min_quality: float = 0.15):
-    """Measured ego speed from two consecutive scans, no model involved.
-    Returns (speed_mps, quality), or (None, quality) when the alignment is too weak."""
-    fwd, left, quality = scan_motion(bev_prev, bev_next, cfg)
-    if quality < min_quality:
-        return None, quality
-    return float(np.hypot(fwd, left)) / dt_s, quality
 
 
 if __name__ == "__main__":

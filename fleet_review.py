@@ -6,11 +6,11 @@ The business question this project answers:
     "We record hours of driving. Which moments should a safety manager actually
      watch, and how risky was each drive?"
 
-Every LiDAR key-frame goes through the collision-risk layer. The car's speed is
-measured from the LiDAR itself (consecutive scans aligned, collision_risk.lidar_odometry)
-and the check runs along the car's current heading over the distance it will cover in
-5.5 s. (The learned planner's path can be used instead with --path model; planner_eval.py
-shows why it is not the default at the epoch-5 checkpoint.)
+Every LiDAR key-frame goes through the collision-risk layer. The car's motion (speed,
+sideways drift, yaw rate) is measured from the LiDAR itself by registering each scan on
+the previous one (odometry_labels.register). The path checked is planner v4's most likely
+path for the next 5.5 s (motion_planner.py) when its cross-validated error beats the CTRV
+baseline, otherwise the lane along the current heading (--path heading forces that).
 
 The recording is split into continuous scenes (drives); each gets the same 0-100 safety
 score as safety_report.py. Every stretch where an obstacle sat in the path less than the
@@ -26,7 +26,7 @@ Outputs (inference_outputs/):
 
 Usage:
     python fleet_review.py                 # all frames in LIDAR_TOP/
-    python fleet_review.py --path model    # scan along the learned path instead
+    python fleet_review.py --path heading  # scan along the current heading instead
     python fleet_review.py --from-csv      # rebuild the summary from fleet_frames.csv
     python fleet_review.py --from-csv --notes qwen3:8b
                                            # + a plain-language review note per top event,
@@ -42,10 +42,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from collision_risk import (RiskConfig, assess_risk, heading_corridor, lidar_odometry,
+from collision_risk import (RiskConfig, assess_risk, heading_corridor, extend_path,
                             effective_level, MOVING_MPS, LEVELS, LEVEL_COLORS)
 from data_preparation_v2 import load_lidar_points, create_bev_representation
-from safety_report import load_planner, predict_path, find_events, safety_score
+from safety_report import find_events, safety_score
 from scene_dashboard import group_scenes, parse_timestamp
 
 ROOT = Path(__file__).resolve().parent
@@ -60,32 +60,51 @@ def city(log_name):
     return "Boston" if "-0400" in log_name else ("Singapore" if "+0800" in log_name else "?")
 
 
-def assess_scene(files, cfg=RiskConfig(), model=None, device=None, dt=DT):
+def default_planner(path_mode="auto"):
+    """Planner v4 if it exists and (in auto mode) beat the CTRV baseline in cross-validation."""
+    from motion_planner import CKPT, MotionPlanner
+    if path_mode == "heading" or not CKPT.exists():
+        return None
+    planner = MotionPlanner()
+    return planner if (path_mode == "learned" or planner.beats_baseline) else None
+
+
+def assess_scene(files, cfg=RiskConfig(), planner=None, dt=DT):
     """Risk for every key-frame of one continuous scene.
 
-    Speed: LiDAR odometry against the previous scan (the next one for the first frame).
-    Path: the heading corridor, or the learned path when a model is given.
+    Motion: the scan registered on the previous one (the next pair for the first frame),
+    kept only when the registration is clear. Path: planner v4's most likely path,
+    extended to the CAUTION range, or the lane along the current heading.
     Returns [(bev, path, RiskResult, speed_mps), ...]."""
-    bevs = [create_bev_representation(load_lidar_points(str(f))) for f in files]
+    from odometry_labels import ego_points, register
+    from motion_planner import median_steps, motion_features
+    pts = [load_lidar_points(str(f)) for f in files]
+    bevs = [create_bev_representation(p) for p in pts]
+    xy = [ego_points(p) for p in pts]
+    steps = [register(xy[j], xy[j + 1]) for j in range(len(xy) - 1)]
+    past = median_steps(steps, centered=False) if steps else []   # same filtering as training
     out = []
     for j, bev in enumerate(bevs):
-        speed = None
-        if len(bevs) > 1:
-            a, b = (j - 1, j) if j > 0 else (0, 1)
-            speed, _ = lidar_odometry(bevs[a], bevs[b], dt, cfg)
-        path = predict_path(model, device, bev) if model is not None else heading_corridor(speed, cfg)
+        i = j - 1 if j > 0 else 0                      # the step that ends at this scan
+        motion = speed = None
+        if steps and steps[i][3] >= 0.15:
+            speed = float(np.hypot(past[i][0], past[i][1])) / dt
+            motion = motion_features(past, j)        # needs two past steps
+        if planner is not None and motion is not None:
+            path = extend_path(planner.predict(bev, motion)[0], cfg)
+        else:
+            path = heading_corridor(speed, cfg)
         out.append((bev, path, assess_risk(path, bev, cfg, speed_mps=speed), speed))
     return out
 
 
-def run_frames(frames, use_model):
-    model = device = None
-    if use_model:
-        model, device = load_planner()
+def run_frames(frames, path_mode):
+    planner = default_planner(path_mode)
+    print("path checked:", "planner v4" if planner else "current heading")
     cfg, rows = RiskConfig(), []
     for k, (start, end) in enumerate(group_scenes(frames)):
         t0 = parse_timestamp(frames[start])
-        results = assess_scene(frames[start:end], cfg, model, device)
+        results = assess_scene(frames[start:end], cfg, planner)
         for f, (_, _, r, speed) in zip(frames[start:end], results):
             rows.append({
                 "scene": k, "log": f.name.split("__")[0], "file": f.name,
@@ -238,15 +257,15 @@ def summary_md(scenes, events, rows, path, notes_model=None):
             lines.append(f"- **Scene {e['scene']} at {e['start_s']:.1f} s:** {e['note']} "
                          f"*Check:* {e['check']}")
     lines += ["", "Thresholds are fixed distances, not tuned on crash or near-miss labels "
-              "(nuScenes has none), and the check follows the car's current heading, so it can "
-              "miss obstacles in a turn. Treat the ranking as a review queue, not a verdict."]
+              "(nuScenes has none), and the lane checked is planner v4's prediction from one scan plus "
+              "the measured motion, so it can be wrong in a sharp turn. Treat the ranking as a review queue, not a verdict."]
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--path", choices=["heading", "model"], default="heading")
+    ap.add_argument("--path", choices=["auto", "learned", "heading"], default="auto")
     ap.add_argument("--from-csv", action="store_true")
     ap.add_argument("--notes", metavar="OLLAMA_MODEL",
                     help="write review notes for the top events with this local model")
@@ -260,7 +279,7 @@ def main():
         frames = sorted(LIDAR_DIR.glob("*.bin"))
         if not frames:
             raise FileNotFoundError(f"No .bin frames in {LIDAR_DIR}")
-        rows = run_frames(frames, args.path == "model")
+        rows = run_frames(frames, args.path)
         write_csv(OUT / "fleet_frames.csv", rows)
 
     scenes, events = summarise(rows)

@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from collision_risk import RiskConfig, obstacle_map, effective_level, LEVEL_COLORS  # noqa: E402
-from fleet_review import assess_scene, counted_level  # noqa: E402
+from fleet_review import assess_scene, counted_level, default_planner  # noqa: E402
 from risk_monitor import render_frame  # noqa: E402
 from safety_report import build_report  # noqa: E402
 
@@ -45,6 +45,7 @@ VIEW = (-12, 48, -22, 22)                      # metres: behind, ahead, right, l
 FONT_DIR = Path("C:/Windows/Fonts")
 INK, MUTED, ACCENT, BG = (28, 32, 38), (95, 103, 115), (41, 128, 185), (250, 250, 248)
 CFG = RiskConfig()
+PLANNER = None                                 # planner v4, loaded in main()
 
 
 def font(size, bold=False):
@@ -138,7 +139,7 @@ def replay_frame(risk_img, levels, k, scene_label):
     d.polygon([(cx - 9, 286), (cx + 9, 286), (cx, 272)], fill=INK)
     notes = [
         "Top-down LiDAR view, the car at the star, driving to the right.",
-        "Blue lane: where the car will be in the next 5.5 s at its speed, measured from the LiDAR.",
+        "Blue: where planner v4 predicts the car will be in the next 5.5 s. That lane is checked.",
         "Red: anything at least 0.5 m tall. Circle: the first obstacle in the lane.",
         "Under 5 m from the bumper while moving: BRAKE, a moment to review. Under 15 m: CAUTION.",
     ]
@@ -171,7 +172,7 @@ def render(item, idx, n):
     # show the level that counts (a close gap while stopped is CLEAR), as in the timeline
     risk = dataclasses.replace(risk, level=effective_level(risk.level, speed))
     return render_frame(bev, path, obstacle_map(bev, CFG), risk, idx, n,
-                        path_label="Lane checked (next 5.5 s)",
+                        path_label="Predicted path, planner v4" if PLANNER else "Lane checked (next 5.5 s)",
                         corridor_m=CFG.corridor_half_width_m, view=VIEW)
 
 
@@ -201,6 +202,8 @@ def main():
     ap.add_argument("--scene", type=int)
     args = ap.parse_args()
 
+    global PLANNER
+    PLANNER = default_planner()
     rows = read_csv("fleet_frames.csv")
     scenes = {int(s["scene"]): s for s in read_csv("fleet_scenes.csv")}
     events = read_csv("fleet_events.csv") if (OUT / "fleet_events.csv").exists() else []
@@ -211,7 +214,7 @@ def main():
     # 1. one real stretch of each level -> README GIFs
     for lvl in ("CLEAR", "CAUTION", "BRAKE"):
         s, a, b = longest_run(rows, lvl)
-        results = assess_scene(scene_files(rows, s))
+        results = assess_scene(scene_files(rows, s), CFG, PLANNER)
         off = first_row[s]
         frames = [render(results[i - off], i - a, b - a) for i in range(a, b)]
         save_gif(frames, ASSETS / f"demo_risk_{lvl.lower()}.gif")
@@ -228,7 +231,7 @@ def main():
         args.scene = next((int(e["scene"]) for e in ranked
                            if int(e["scene"]) in varied and float(e["start_s"]) >= 4.0),
                           int(ranked[0]["scene"]) if ranked else 0)
-    results = assess_scene(scene_files(rows, args.scene))
+    results = assess_scene(scene_files(rows, args.scene), CFG, PLANNER)
     levels = [effective_level(r.level, sp) for _, _, r, sp in results]
     s = scenes[args.scene]
     label = (f"A real {len(results) * 0.5:.0f}-second drive in {s['city']} from the nuScenes "
@@ -236,7 +239,7 @@ def main():
     build_report(levels, [r.nearest_dist_m for _, _, r, _ in results],
                  [r.ttc_s for _, _, r, _ in results], [sp for _, _, _, sp in results], 0.5,
                  f"{rows[first_row[args.scene]]['log']}  (scene {args.scene})", len(results),
-                 "heading")
+                 "learned" if PLANNER else "heading")
     import fitz
     pdf = fitz.open(OUT / "safety_report.pdf")
     for n in range(2):
@@ -271,12 +274,27 @@ def main():
                        "This drive's report: score, time at each risk level, risk events by closest gap."), 5)
     hold(picture_slide("Across the whole recording", ASSETS / "fleet_overview.png",
                        "The riskiest drives come first, so a reviewer starts where it matters."), 5)
+    import torch
+    from motion_planner import CKPT
+    cv = torch.load(CKPT, map_location="cpu", weights_only=False)
+    v4 = cv["cv"]["Planner v4 (this work)"]
+    best_base = min((n for n in cv["cv"] if n not in ("Planner v4 (this work)", "Epoch-5 planner (one scan)")),
+                    key=lambda n: cv["cv"][n][0])
+    base = cv["cv"][best_base]
+    multi = list(cv["multi"].values())
+    hold(numbers_card("The model", "Trained at scale, tested on drives it never saw",
+                      [("200 GB", "of nuScenes driving data, trained on AWS SageMaker"),
+                       (f"{100 * (base[1] - v4[1]) / base[1]:.0f}%", "lower final error than the best physics baseline"),
+                       (f"{100 * (multi[0] - multi[1]) / multi[0]:.0f}%",
+                        "lower error for its 3 candidate paths than 3 physics guesses")],
+                      "5-fold cross-validation split by drive, on 1,945 key-frames with labels recovered "
+                      "from the LiDAR itself."), 6)
     hold(card("How it's built",
-              ["Python data pipeline over 200 GB of nuScenes on AWS SageMaker; LiDAR turned into "
-               "top-down maps; speed measured by aligning consecutive scans.",
-               "PyTorch models: a bird's-eye-view trajectory planner and a YOLOv8 camera detector. "
-               "I tested the planner against the car's real motion, found a training bug, and keep "
-               "the risk check on the measured heading until it is retrained.",
+              ["A bird's-eye-view network (PyTorch, ~12 M parameters) trained on 200 GB of nuScenes on "
+               "AWS SageMaker reads each LiDAR scan; planner v4 adds the car's motion, measured by "
+               "registering consecutive scans, and predicts 3 candidate paths for the next 5.5 s.",
+               "A NumPy risk layer checks the predicted lane; close calls while moving go into the "
+               "review queue. A YOLOv8 camera detector runs alongside.",
                "A local language model writes a plain-language note for each flagged moment."],
               "Under the hood"), 8)
     hold(card("Iyed Mediouni", ["AI & software engineer, Tunisia, open to remote work.",

@@ -98,7 +98,7 @@ class NuscenesAugmentedDataset(Dataset):
             trajectory[:, 1] *= -1  # Flip Y axis
             # The tensor is (C, sensor x = lateral, sensor y = forward): mirroring left and
             # right flips dim 1, i.e. vflip. (hflip flipped the forward axis; the epoch-5
-            # checkpoint was trained with that bug, see planner_eval.py.)
+            # checkpoint was trained with that bug, see motion_planner.py.)
             bev = TF.vflip(bev)
         
         return bev, trajectory

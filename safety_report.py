@@ -113,7 +113,7 @@ def build_report(levels, dists, ttcs, speeds, dt, scene_name, n_frames, mode):
     lines = [
         f"Scene             : {scene_name}",
         f"Frames analysed   : {n_frames}  (~{n_frames*dt:.0f} s at {1/dt:.0f} Hz key-frames)",
-        f"Path checked      : {'learned planner path' if mode == 'model' else 'current heading, LiDAR-measured speed'}",
+        f"Path checked      : {'planner v4 path' if mode == 'learned' else 'current heading'}, LiDAR-measured motion",
         "",
         f"Time CLEAR        : {pct['CLEAR']:.0f}%   ({counts['CLEAR']} frames)",
         f"Time CAUTION      : {pct['CAUTION']:.0f}%   ({counts['CAUTION']} frames)",
@@ -182,12 +182,12 @@ def main():
     ap.add_argument("--scene", type=int, default=0,
                     help="which continuous scene to report on (0-based)")
     ap.add_argument("--stride", type=int, default=1)
-    ap.add_argument("--path", choices=["heading", "model"], default="heading",
-                    help="scan along the car's heading (default) or the learned path")
+    ap.add_argument("--path", choices=["auto", "learned", "heading"], default="auto",
+                    help="planner v4's path if it beat the baseline (auto), or force one")
     args = ap.parse_args()
 
     from scene_dashboard import group_scenes
-    from fleet_review import assess_scene
+    from fleet_review import assess_scene, default_planner
     from collision_risk import effective_level
     OUT.mkdir(exist_ok=True)
     all_frames = sorted(LIDAR_DIR.glob("*.bin"))
@@ -199,17 +199,16 @@ def main():
     scene_name = f"{frames[0].name.split('__')[0]}  (scene {args.scene} of {len(scenes)})"
     dt = KEYFRAME_DT * args.stride
 
-    model = device = None
-    if args.path == "model":
-        model, device = load_planner()
-    results = assess_scene(frames, RiskConfig(), model, device, dt)
+    planner = default_planner(args.path)
+    results = assess_scene(frames, RiskConfig(), planner, dt)
     levels = [effective_level(r.level, sp) for _, _, r, sp in results]
     dists = [r.nearest_dist_m for _, _, r, _ in results]
     ttcs = [r.ttc_s for _, _, r, _ in results]
     speeds = [sp for _, _, _, sp in results]
 
     score, counts, n_ev = build_report(levels, dists, ttcs, speeds, dt,
-                                        scene_name, len(frames), args.path)
+                                        scene_name, len(frames),
+                                        "heading" if planner is None else "learned")
     print(f"\nSafety score {score:.0f}/100 · {counts} · {n_ev} risk events")
     print(f"Saved {OUT / 'safety_report.pdf'}")
 
