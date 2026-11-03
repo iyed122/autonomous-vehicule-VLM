@@ -133,8 +133,9 @@ def run_bev(num_frames=6):
 
         # --- plot ---
         fig, ax = plt.subplots(figsize=(7, 7))
-        ax.imshow(bev[:, :, 2], cmap="gray", origin="lower",
-                  extent=[-50, 50, -50, 50], alpha=0.85)
+        from collision_risk import bev_for_display
+        img, extent = bev_for_display(bev[:, :, 2])
+        ax.imshow(img, cmap="gray", origin="lower", extent=extent, alpha=0.85)
         colors = ["#2ecc71", "#3498db", "#f39c12"]
         for m, (t, p) in enumerate(zip(trajs, mode_probs)):
             ax.plot(t[:, 0], t[:, 1], color=colors[m], lw=2,

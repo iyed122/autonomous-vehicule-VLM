@@ -182,8 +182,9 @@ elif task == "BEV trajectory prediction":
 
         col1, col2 = st.columns(2)
         fig, ax = plt.subplots(figsize=(6, 6))
-        ax.imshow(bev[:, :, 2], cmap="gray", origin="lower",
-                  extent=[-50, 50, -50, 50], alpha=0.85)
+        from collision_risk import bev_for_display
+        img, extent = bev_for_display(bev[:, :, 2])
+        ax.imshow(img, cmap="gray", origin="lower", extent=extent, alpha=0.85)
         colors = ["#2ecc71", "#3498db", "#f39c12"]
         for m, (t, p) in enumerate(zip(trajs, mode_probs)):
             ax.plot(t[:, 0], t[:, 1], color=colors[m], lw=2,
@@ -224,7 +225,7 @@ elif task == "Scene dashboard (multi-frame → GIF)":
 
     import torch
     from data_preparation_v2 import load_lidar_points, create_bev_representation
-    from collision_risk import RiskConfig, assess_risk, straight_fallback_path
+    from collision_risk import RiskConfig, assess_risk, straight_fallback_path, PRED_HORIZON_S
     import scene_dashboard as sd
 
     all_lidar = sorted(LIDAR_DIR.glob("*.bin"))
@@ -307,7 +308,7 @@ elif task == "Scene dashboard (multi-frame → GIF)":
                 path = best[0].cpu().numpy()
             else:
                 path = straight_fallback_path(30, 20)
-            risk = assess_risk(path, bev, cfg, horizon_s=20 * 0.5)
+            risk = assess_risk(path, bev, cfg, horizon_s=PRED_HORIZON_S)
             counts[risk.level] += 1
 
             cam_rgb = None
@@ -345,7 +346,7 @@ else:
     import vlm_reasoner as vlm
     import scene_dashboard as sd
     from data_preparation_v2 import load_lidar_points, create_bev_representation
-    from collision_risk import RiskConfig, assess_risk, straight_fallback_path
+    from collision_risk import RiskConfig, assess_risk, straight_fallback_path, PRED_HORIZON_S
 
     host = st.text_input("Ollama host", vlm.OLLAMA_DEFAULT_HOST)
     models = vlm.list_ollama_models(host)
@@ -387,7 +388,7 @@ else:
         with st.spinner("Building surround + LiDAR BEV…"):
             bev = create_bev_representation(load_lidar_points(lf))
             path = straight_fallback_path(30, 20)
-            risk = assess_risk(path, bev, RiskConfig(), horizon_s=20 * 0.5)
+            risk = assess_risk(path, bev, RiskConfig(), horizon_s=PRED_HORIZON_S)
             bev_render = sd.render_dashboard_frame(bev, path, risk, 0, 1, camera_rgb=None)
             if cam_dir and Path(cam_dir).is_dir():
                 cams = [str(p) for p in Path(cam_dir).rglob("*")

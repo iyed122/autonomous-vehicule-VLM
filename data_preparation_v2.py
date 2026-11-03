@@ -283,16 +283,14 @@ def create_bev_representation(
     # Create BEV channels
     bev = np.zeros((grid_size, grid_size, 3), dtype=np.float32)
     
-    # Channel 0: Height (max z)
-    for i in range(len(points)):
-        xi, yi = x_idx[i], y_idx[i]
-        bev[xi, yi, 0] = max(bev[xi, yi, 0], (points[i, 2] - z_range[0]) / (z_range[1] - z_range[0]))
+    # Channel 0: Height (max normalised z per cell)
+    height = ((points[:, 2].astype(np.float64) - z_range[0]) / (z_range[1] - z_range[0])).astype(np.float32)
+    np.maximum.at(bev[:, :, 0], (x_idx, y_idx), height)
     
-    # Channel 1: Intensity
+    # Channel 1: Intensity (max per cell)
     if points.shape[1] >= 4:
-        for i in range(len(points)):
-            xi, yi = x_idx[i], y_idx[i]
-            bev[xi, yi, 1] = max(bev[xi, yi, 1], min(points[i, 3] / 255.0, 1.0))
+        intensity = np.minimum(points[:, 3] / 255.0, 1.0).astype(np.float32)
+        np.maximum.at(bev[:, :, 1], (x_idx, y_idx), intensity)
     
     # Channel 2: Density
     density = np.zeros((grid_size, grid_size), dtype=np.float32)

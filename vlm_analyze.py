@@ -31,13 +31,12 @@ import matplotlib.pyplot as plt
 
 import scene_dashboard as sd
 import vlm_reasoner as vlm
-from collision_risk import RiskConfig, assess_risk, straight_fallback_path, LEVEL_COLORS
+from collision_risk import RiskConfig, assess_risk, straight_fallback_path, LEVEL_COLORS, PRED_HORIZON_S
 from data_preparation_v2 import load_lidar_points, create_bev_representation
 
 ROOT = Path(__file__).resolve().parent
 LIDAR_DIR = ROOT / "LIDAR_TOP"
 OUT = ROOT / "inference_outputs"
-KEYFRAME_DT = 0.5
 
 
 def predict_path(bev, straight):
@@ -120,7 +119,7 @@ def main():
 
     bev = create_bev_representation(load_lidar_points(lf))
     path = predict_path(bev, args.straight)
-    risk = assess_risk(path, bev, RiskConfig(), horizon_s=20 * KEYFRAME_DT)
+    risk = assess_risk(path, bev, RiskConfig(), horizon_s=PRED_HORIZON_S)
     bev_render = sd.render_dashboard_frame(bev, path, risk, 0, 1, camera_rgb=None)
 
     # --- assemble the 6-camera surround ---

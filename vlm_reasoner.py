@@ -209,6 +209,7 @@ class OllamaVLM(VLMBackend):
             "messages": [message],
             "stream": False,
             "format": "json",          # force well-formed JSON output
+            "think": False,            # reasoning models (qwen3): answer directly
             "options": {"temperature": 0.2},
         }
         r = requests.post(f"{self.host}/api/chat", json=payload, timeout=self.timeout)

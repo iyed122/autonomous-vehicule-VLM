@@ -41,12 +41,11 @@ matplotlib.use("Agg")
 
 import scene_dashboard as sd
 import vlm_reasoner as vlm
-from collision_risk import RiskConfig, assess_risk, straight_fallback_path
+from collision_risk import RiskConfig, assess_risk, straight_fallback_path, PRED_HORIZON_S
 
 ROOT = Path(__file__).resolve().parent
 LIDAR_DIR = ROOT / "LIDAR_TOP"
 OUT = ROOT / "demo" / "scenes"
-KEYFRAME_DT = 0.5
 
 
 # --------------------------------------------------------------------------- #
@@ -90,7 +89,7 @@ def select_demo_scenes(lidar_files, n=5, min_len=8, sample=4):
         levels = []
         for i in idxs:
             bev = fast_bev(load_lidar(str(lidar_files[i])))
-            levels.append(assess_risk(path, bev, cfg, horizon_s=10.0).level)
+            levels.append(assess_risk(path, bev, cfg, horizon_s=PRED_HORIZON_S).level)
         from collections import Counter
         dom = Counter(levels).most_common(1)[0][0]
         scored.append({"idx": si, "start": s, "end": e, "len": e - s, "dominant": dom})
@@ -132,7 +131,7 @@ def build_frame_composite(lidar_path, cam_paths, cfg):
     """Surround montage (6 cams) + BEV tile for one frame; returns (composite_rgb, risk)."""
     bev = fast_bev(load_lidar(lidar_path))
     path = straight_fallback_path(30, 20)
-    risk = assess_risk(path, bev, cfg, horizon_s=20 * KEYFRAME_DT)
+    risk = assess_risk(path, bev, cfg, horizon_s=PRED_HORIZON_S)
     bev_render = sd.render_dashboard_frame(bev, path, risk, 0, 1, camera_rgb=None)
     composite = sd.assemble_surround(cam_paths, bev_rgb=bev_render)
     return composite, risk

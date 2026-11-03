@@ -1,10 +1,12 @@
-# Demo media
+# Demo
 
-Drop the narrated screen-recording of the Streamlit app here, e.g. `demo_walkthrough.mp4`,
-and reference it from the top-level README. GitHub auto-embeds `.mp4` uploaded through
-the web UI or attached to a Release; for an in-README inline player, upload the video to
-the repo's Issues/Release and paste the generated `https://github.com/.../assets/...` URL.
+- `demo.mp4`: one-minute walkthrough (business question, live replay of a real drive, the safety
+  report, the fleet answer). Rebuilt from the trained model by `make_demo.py`.
+- `screenshots/`: the Streamlit app's detection and trajectory tabs.
 
-Suggested files:
-- `demo_walkthrough.mp4`  — narrated app walkthrough (your recording)
-- screenshots of each tab (YOLO / BEV / Scene dashboard)
+Everything here is generated from real nuScenes LiDAR and the trained planner:
+
+```bash
+python fleet_review.py        # writes inference_outputs/fleet_*.csv
+python demo/make_demo.py      # GIFs, report images, demo.mp4
+```

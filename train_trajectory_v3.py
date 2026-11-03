@@ -96,7 +96,10 @@ class NuscenesAugmentedDataset(Dataset):
         # Random horizontal flip (mirror left turns to right turns and vice versa)
         if np.random.random() > 0.5:
             trajectory[:, 1] *= -1  # Flip Y axis
-            bev = TF.hflip(bev)
+            # The tensor is (C, sensor x = lateral, sensor y = forward): mirroring left and
+            # right flips dim 1, i.e. vflip. (hflip flipped the forward axis; the epoch-5
+            # checkpoint was trained with that bug, see planner_eval.py.)
+            bev = TF.vflip(bev)
         
         return bev, trajectory
 
@@ -232,7 +235,9 @@ class ImprovedTrajectoryLoss(nn.Module):
         smooth_targets = torch.zeros_like(mode_probs)
         smooth_targets.scatter_(1, best_mode.unsqueeze(1), 0.85)
         smooth_targets += 0.15 / num_modes
-        mode_loss = F.cross_entropy(mode_probs, smooth_targets)
+        # cross_entropy applies log-softmax itself, so it must get logits, not the
+        # softmaxed mode_probs (the epoch-5 checkpoint was trained with mode_probs here).
+        mode_loss = F.cross_entropy(outputs['mode_logits'], smooth_targets)
         
         # DIVERSITY LOSS - encourage different predictions per mode
         final_positions = pred_trajs[:, :, -1, :]  # (B, K, 2)

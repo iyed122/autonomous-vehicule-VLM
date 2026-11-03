@@ -1,230 +1,208 @@
-# 🚗 Autonomous Perception & Planning for ADAS — YOLO + BEV on nuScenes
+# Driving-risk review on nuScenes: LiDAR trajectory prediction, collision risk, fleet safety scoring
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-YOLOv8%20%2B%20BEV-ee4c2c)
 ![Dataset](https://img.shields.io/badge/Dataset-nuScenes-success)
 ![Cloud](https://img.shields.io/badge/Trained%20on-AWS%20SageMaker-orange)
-![VLM](https://img.shields.io/badge/VLM-Qwen2.5--VL%20%C2%B7%20Ollama-7b3fbf)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
-> A two-stage self-driving perception stack that **sees the road, predicts where the car is going, and decides whether to brake** — trained on the nuScenes dataset on AWS SageMaker, and packaged as an interactive demo you can run locally.
+**The business question.** Fleets and insurers record hours of driving and can't watch it all.
+*Which moments should a safety manager actually look at, and how risky was each drive?*
+
+**What this repo gives back.** Every drive gets a 0–100 safety score, and only the close calls
+(an obstacle in the car's lane, under 5 m from the bumper, while moving) go into a review queue.
+On 28 minutes of real nuScenes driving (Boston and Singapore), that queue is
+**9 moments, 0.6 minutes of footage, 2% of the recording.**
 
 <p align="center">
   <img src="assets/demo_risk_clear.gif" width="32%"/>
   <img src="assets/demo_risk_caution.gif" width="32%"/>
   <img src="assets/demo_risk_brake.gif" width="32%"/>
 </p>
-<p align="center"><em>Live collision-risk monitor — the same pipeline, three outcomes: CLEAR · CAUTION · BRAKE.</em></p>
+<p align="center"><em>Real LiDAR scans, top-down: the blue lane is where the car will be in the next 5.5 s. CLEAR · CAUTION · BRAKE.</em></p>
 
-## ▶️ Demo
-
-The three GIFs above are the live collision-risk monitor. The panels below are captured from the Streamlit app; the narrated scene clips live in [`demo/scenes/`](demo/scenes/).
-
-### Screenshots
-
-| Detection | BEV trajectory | Scene dashboard | VLM co-pilot |
-|---|---|---|---|
-| ![det](demo/screenshots/yolo_detection.png) | ![bev](demo/screenshots/bev_trajectory.png) | ![dash](demo/screenshots/scene_dashboard.png) | ![vlm](demo/screenshots/vlm_reasoning.png) |
-
-_(screenshots live in [`demo/screenshots/`](demo/screenshots/); the narrated scene clips are in [`demo/scenes/`](demo/scenes/))_
+▶️ **[Watch the 45-second walkthrough](demo/demo.mp4)**: the question, the answer, one real drive, the evidence, how it's built.
 
 ---
 
-## What this is
+## In plain words
 
-Forward-collision warning and automatic emergency braking sit at the core of every modern driver-assistance (ADAS) and autonomy product. The capability behind them is always the same loop: **perceive the scene → predict the path → flag the conflict.** That loop usually spans two specialist teams. This project is one engineer owning the whole slice, end to end:
+1. **See.** Each LiDAR scan becomes a top-down map of the car's surroundings (100 m × 100 m).
+   The car's speed is measured by aligning consecutive scans: no model, no guesswork.
+2. **Check the lane ahead.** The lane the car will cover in the next 5.5 seconds is searched for
+   anything at least 0.5 m tall. First obstacle less than 5 m from the front bumper: **BRAKE**;
+   under 15 m: **CAUTION**; otherwise **CLEAR**, with the gap and the time to reach it.
+3. **Review.** Over a whole recording, every drive is scored and every BRAKE moment *while moving*
+   (not at a red light) is queued for a human, worst first, with a plain-language note written by
+   a local language model.
+4. **Learn.** Two models trained on 200 GB of nuScenes on AWS SageMaker: a bird's-eye-view network
+   that predicts the car's next 5.5 s as three candidate paths, and a YOLOv8 camera detector. The
+   planner is evaluated against the car's real motion before it is trusted (below).
 
-- **Perception** — a YOLOv8 detector finds obstacles (vehicles, pedestrians, cyclists) in the camera feed.
-- **Planning** — a custom bird's-eye-view (BEV) network predicts the ego vehicle's short-horizon trajectory from LiDAR, with several weighted hypotheses.
-- **Decision** — a fusion layer projects the predicted path against the LiDAR obstacle map and emits a **CLEAR / CAUTION / BRAKE** signal with distance-to-obstacle and time-to-obstacle (TTC).
+## Who would use the output
 
-The result runs three ways: a live **Streamlit demo**, a **collision-risk video monitor** over a driving scene, and a per-scene **PDF safety report**.
-
-📄 **Full technical write-up:** [`Technical_Report.pdf`](Technical_Report.pdf) — architecture, algorithms, math, and business analysis in depth.
-🎬 **Demo walkthrough:** see [`demo/`](demo/) (narrated screen recording of the app).
-
----
-
-## Why it matters (the business case)
-
-A fused *detect-and-predict-and-decide* module is the input to three different products, and **the same code path serves all of them — only the consumer of the output changes:**
-
-| Market | What they consume | Output used |
+| User | Question they have | What they get here |
 |---|---|---|
-| **ADAS / OEM** | real-time warn & brake | CLEAR/CAUTION/BRAKE + TTC, per frame |
-| **Fleet & usage-based insurance** | per-drive risk score | risk timeline + near-miss events (the PDF report) |
-| **AV research / validation** | scene triage & labelling | multi-modal trajectories + risk profile |
+| Fleet safety manager | Which clips do I watch, which drivers do I coach? | `fleet_review.py`: ranked BRAKE moments, minutes of footage to review, per-drive score |
+| Usage-based insurer | How risky is this vehicle's driving? | per-drive safety score and time at each risk level |
+| AV / ADAS data team | Where are the hard scenes in our logs? | risk timeline per scene, multi-modal paths, near-miss list |
+| ADAS engineer | Is there something in my path, and how soon? | per-frame CLEAR / CAUTION / BRAKE with distance and time-to-collision |
 
-Distance-to-obstacle and time-to-obstacle are the quantities every one of these is ultimately built on. That is the value this project demonstrates — not a leaderboard number, but a correct, runnable pipeline that produces a *decision*.
+## Results on real data
+
+![Fleet overview](assets/fleet_overview.png)
+
+| Fleet review (all local data) | Value |
+|---|---|
+| Driving analysed | 28 min: 3,376 LiDAR key-frames, 68 scenes, Boston and Singapore |
+| Time at each risk level (moving) | CLEAR 22.8 min · CAUTION 5.2 min · BRAKE 0.2 min |
+| Close calls queued (BRAKE while moving) | 9, in 6 of 68 scenes |
+| Footage left to watch (2 s lead-in each) | 0.6 min, 2% of the recording, worst first |
+
+| Trained models | Value | What it means |
+|---|---|---|
+| Trajectory planner, validation ADE / FDE | 3.29 m / 7.23 m | average / final position error over a 5.5 s horizon, epoch-5 checkpoint |
+| YOLOv8n detector, precision / recall | 0.64 / 0.30 | one generic "object" class, 20 epochs on CPU, still improving when stopped |
+| YOLOv8n detector, mAP@0.50 / @0.50–0.95 | 0.35 / 0.21 | rose every epoch (0.04 → 0.35): compute-limited, not converged |
+
+**Is the learned planner good enough to drive the risk check?** `planner_eval.py` compares its
+position 3 s ahead with the car's real motion, recovered from the LiDAR (97 moving frames):
+
+| 3 s ahead | mean absolute error |
+|---|---|
+| Sideways, learned planner (epoch 5) | 0.91 m |
+| Sideways, 'keeps its heading' baseline | 0.10 m |
+| Forward distance, learned planner | 17.3 m (real median 12.8 m, planner median 30.7 m) |
+
+Not yet: its sideways prediction is worse than "keep the heading" (correlation -0.10). The cause
+is a training bug found in the audit (the mirror augmentation flipped the forward axis), so the risk
+check follows the measured heading until the planner is retrained.
+
+Every number comes from the training logs, the checkpoint metadata, `fleet_review.py` or
+`planner_eval.py` output in this repo. The detector was trained on a laptop CPU; both models are
+listed under "What's next".
+
+<p align="center">
+  <img src="assets/safety_report_p1.png" width="45%"/>
+  <img src="assets/safety_report_p2.png" width="45%"/>
+</p>
+<p align="center"><em>The per-drive safety report for the demo scene (<code>safety_report.py</code>).</em></p>
 
 ---
 
-## System architecture
+## How it works
 
 ```
-   ┌──────────────┐   camera    ┌─────────────────┐  boxes
-   │  CAM_FRONT    ├────────────►│  YOLOv8 detector ├───────────┐
-   └──────────────┘             └─────────────────┘  (named)    │
-                                                                 ▼
-                                                        ┌──────────────────┐
-   ┌──────────────┐  LiDAR BEV  ┌─────────────────┐    │  collision-risk   │  CLEAR
-   │  LIDAR_TOP    ├────────────►│  BEV planner net ├───►│  fusion           ├─ CAUTION
-   │  (.pcd.bin)   │  500×500×3  │  (multi-modal)   │    │  path × obstacles │  BRAKE
-   └──────────────┘             └─────────────────┘    └──────────────────┘  + dist/TTC
-                                  3 paths · mode probs
-                                  · per-waypoint conf
+   LIDAR_TOP scans ─► BEV rasters ─┬─► obstacle map (≥ 0.5 m tall) ─────────────────┐
+   (.pcd.bin, 2 Hz)   500×500×3    ├─► LiDAR odometry (scan alignment) ─► speed ─► lane ahead (5.5 s)
+                                   │                                                 ▼
+                                   │                      risk layer ─► CLEAR / CAUTION / BRAKE + gap, TTC
+                                   │                                                 ▼
+                                   │      safety_report.py (one drive) · fleet_review.py (review queue)
+                                   │                                                 ▼
+                                   │                local language model (Ollama) ─► review notes
+                                   │
+                                   └─► BEV planner (PyTorch) ─► 3 paths ─► planner_eval.py vs real motion
+   CAM_FRONT images ─► YOLOv8 detector ─► named boxes (alongside; not yet fused)
 ```
 
-**Two complementary sensors, two models, one decision surface.** The camera answers *what is ahead*; the LiDAR planner answers *where am I going*; the fusion layer answers *is that a problem*.
+- **Data pipeline** (`data_preparation_v2.py`): parses the nuScenes tables, builds the ground-truth
+  future path in the car's own frame (`p_ego = R⁻¹ · (p_world − t)`), and rasterises each LiDAR
+  sweep into height / intensity / density channels at 0.2 m per cell.
+- **Planner** (`trajectory_model.py`, `train_trajectory_v3.py`): VGG-style encoder → 256-d embedding
+  → 3 trajectory heads, a mode-probability head and a per-waypoint confidence head (~12 M parameters).
+  Trained with a winner-takes-all Huber loss, a mode-classification loss and a diversity term
+  against "always go straight", with rotation and mirror augmentation (the mirror flipped the wrong
+  axis; fixed for the next run).
+- **Risk layer** (`collision_risk.py`, pure NumPy): converts the lane from the car's frame
+  (x forward) into the LiDAR's frame (y forward), walks it outward from the front bumper inside a
+  vehicle-wide corridor and stops at the first obstacle cell. TTC = gap / speed. Gaps while the
+  car is stopped or crawling under 7 km/h don't count as close calls.
+- **LiDAR odometry** (`collision_risk.lidar_odometry`): the car's speed comes from aligning two
+  consecutive scans with an FFT cross-correlation; the peak is how far the world moved.
+- **Planner evaluation** (`planner_eval.py`): compares the planner's position 3 s ahead with the
+  car's real motion, recovered the same way. That test is why the lane follows the measured heading
+  for now: see the table above and the technical report.
+- **Detector**: YOLOv8n fine-tuned on 20,256 nuScenes frames, or the stock COCO model filtered to
+  road classes for named boxes.
+- **Language layer** (`vlm_reasoner.py`): a local Ollama model turns the measured numbers into a
+  plain-language note and a spoken driver instruction. Run live with `qwen3:8b` (text). The vision
+  path (six cameras + the LiDAR view to Qwen2.5-VL) is built and tested against a stub; running it
+  for real needs a time-synchronised camera set, see the [technical report](docs/Technical_Report.md#10-vlm-reasoning-layer-vlm_reasonerpy-vlm_analyzepy).
+- **Recovering a lost model**: the planner's class definition was lost with the SageMaker
+  instance. It was rebuilt from the 146 MB checkpoint alone and verified to load all 130 weight
+  tensors exactly (`load_state_dict(strict=True)`).
 
----
-
-## The two models
-
-### 1 · YOLOv8 obstacle detector
-Fine-tuned on **20,256** nuScenes camera frames. The training run used a single `object` class (so the warning logic is "anything with enough confidence is something to avoid"); the app also offers a stock **COCO-pretrained YOLOv8** filtered to road classes (`person, bicycle, car, motorcycle, bus, truck`) for **named** detection with zero extra training.
-
-![YOLO detections](assets/yolo_detections_1.jpg)
-
-### 2 · BEV multi-modal trajectory planner
-A VGG-style encoder turns a **500×500×3** LiDAR bird's-eye raster (height / intensity / density) into a 256-d scene embedding shared by four heads: **3 candidate trajectories** (20 waypoints each), a **mode probability**, a **per-waypoint confidence**, and an auxiliary **8-class BEV segmentation** head. Multi-modality matters because at an intersection the "correct" future isn't unique — a safety layer must weigh several.
-
-![BEV trajectory](assets/bev_trajectory_1.png)
-
----
-
-## 🧠 VLM reasoning layer (open-vocabulary, neuro-symbolic)
-
-The geometric stack is precise but **closed-vocabulary**: it measures *where* obstacles are, not *what they mean*. A local **Vision-Language Model** (Qwen2.5-VL via [Ollama](https://ollama.com)) adds the missing semantic layer. Crucially it reasons over the **full 6-camera surround view and the LiDAR BEV at once** — not just the front camera a driver already sees — and returns:
-
-- an **open-vocabulary hazard list** the detector structurally cannot produce — construction zones, emergency vehicles, traffic-light state, road debris, animals, vulnerable road users, weather/road-surface conditions;
-- a one-line **scene caption**;
-- a **corroboration** of the CLEAR / CAUTION / BRAKE decision with a natural-language **rationale** — an independent second channel that can catch what a LiDAR-only risk layer misses;
-- a **recommended action**.
-
-A VLM can't read raw point clouds, so the LiDAR is handed to it as the rendered **BEV image** alongside the six cameras — it reasons over all seven views jointly. This turns a classical perception/planning stack into a **neuro-symbolic** system: geometry for precise *measurement*, language for *meaning* and *explanation*.
-
-![VLM reasoning card](assets/vlm_reasoning_demo.png)
-
-### Narrated scene demo (`scene_narrator.py`)
-
-The headline VLM demo: pick **4–5 scenes** (auto-split from the LiDAR stream by timestamp and chosen for risk variety) and have the VLM **narrate each scene as it unfolds** — reasoning across all 6 camera angles *and* the LiDAR BEV over the scene's ~20 frames. It emits a live "co-pilot" comment per segment plus a holistic scene summary, rendered as a subtitled clip (GIF + MP4) with a text transcript per scene.
-
-```bash
-ollama pull qwen2.5vl:7b
-python scene_narrator.py --cam-dir <nuscenes_cams> --scenes 5 --model qwen2.5vl:7b
-# offline structure check (no GPU/server):  python scene_narrator.py --backend mock --scenes 3
-```
-
-Outputs land in [`demo/scenes/`](demo/scenes/) (one GIF + MP4 + transcript per scene, plus an index).
-
-Also available as a **Streamlit tab** ("VLM scene reasoning") that lists your local Ollama models and runs live in the app — a vision model (e.g. `qwen3-vl`) sees the surround + BEV, while text-only models (`qwen3:8b`, `phi3.5`) reason over the perception summary. The app shows a badge for which mode is active.
-
-> Runs fully locally via Ollama — `ollama pull qwen2.5vl:7b`. The backend is pluggable: `qwen3:8b` also works but is **text-only** (it reasons over the structured perception summary without seeing the images — use a `*-vl` model for true vision). `--backend mock` runs the entire pipeline with no GPU or server, for development.
-
----
-
-## Data pipeline — from 200 GB on AWS SageMaker to local inference
-
-The model was developed on an **AWS SageMaker** notebook instance against the full ~200 GB [nuScenes](https://www.nuscenes.org/) dataset. The pipeline (`data_preparation_v2.py`):
-
-1. **Parse nuScenes metadata** — link each `sample` to its `LIDAR_TOP` sweep, ego pose, calibrated sensors, and 3-D annotations.
-2. **Build ego trajectories** — read future ego poses, transform them into the current ego frame, and interpolate to a fixed 20-waypoint horizon — the ground-truth path the planner learns.
-3. **Rasterize LiDAR to BEV** — project each point cloud into a 500×500 top-down grid with height / intensity / density channels.
-4. **Train on SageMaker** — `train_trajectory_v3.py` adds rotation/flip augmentation and a mode-diversity loss to stop the network collapsing to "always go straight".
-
-**Local inference** is deliberately lightweight: the trained weights ship in the repo (via Git LFS), and every tool runs on a laptop CPU against a handful of sample frames — no 200 GB download needed to see it work. The original `trajectory_model.py` was lost with the SageMaker instance and **reconstructed from the checkpoint** (verified to match all 130 weight tensors exactly).
-
----
-
-## Results
-
-*All numbers read directly from the training logs in this repo — nothing invented.*
-
-| YOLOv8 detector (20 ep, CPU) | | BEV planner (epoch 5) | |
-|---|---|---|---|
-| Precision | 0.64 | Val ADE | 3.29 m |
-| Recall | 0.30 | Val FDE | 7.23 m |
-| mAP@0.50 | 0.35 | Modes | 3 |
-| mAP@0.50–0.95 | 0.21 | Horizon | 20 waypoints |
-
-The detector's mAP rose monotonically across all 20 epochs (0.04 → 0.35) — it was compute-limited (CPU, single class), not converged. The planner is an early checkpoint and predicts mostly-straight paths; the v3 training recipe targets exactly that. **The point of the project is the engineering of a correct, runnable stack** — both limitations are documented honestly in the [technical report](Technical_Report.pdf).
-
-![YOLO training curves](assets/yolo_training_curves.png)
-
----
-
-## The product layer
-
-### Live risk monitor
-`python risk_monitor.py` → an annotated video over a driving scene (ego, predicted path, in-path obstacles, live banner). The three GIFs at the top of this page are frames of it.
-
-### Fleet safety report
-`python safety_report.py` → a one-page PDF: a 0–100 scene safety score, time spent at each risk level, the risk/distance/speed timeline, and ranked near-miss events.
-
-![Safety report](assets/safety_report_p1-1.png)
-
-### Interactive app — `streamlit run app.py`
-Three tabs: **object detection** (fine-tuned or named), **trajectory prediction**, and a **scene dashboard** that pairs your `CAM_FRONT` frames to LiDAR *by timestamp* and renders a synchronized camera + BEV + risk **GIF** over a chosen scene.
+Full details, formulas and known issues: **[docs/Technical_Report.md](docs/Technical_Report.md)**.
 
 ---
 
 ## Run it
 
 ```bash
-pip install -r requirements.txt            # CPU is fine for inference
+pip install -r requirements.txt               # CPU is enough for inference
+# put nuScenes LIDAR_TOP key-frames (*.pcd.bin) in ./LIDAR_TOP (the free mini split works)
 
-streamlit run app.py                       # interactive demo (3 tabs)
-
-python run_inference.py named              # named detection (car/truck/bus/person/…)
-python run_inference.py bev                # trajectory prediction on LiDAR
-python vlm_analyze.py --backend mock --straight   # VLM reasoning (offline demo)
-python scene_narrator.py --backend mock --scenes 3  # narrated scene demo (offline)
-# real VLM:  ollama pull qwen2.5vl:7b  then
-# python vlm_analyze.py --cam-dir <nuscenes_cams> --model qwen2.5vl:7b
-python risk_monitor.py                     # → inference_outputs/risk_monitor.mp4
-python safety_report.py                    # → inference_outputs/safety_report.pdf
-python trajectory_model.py                 # sanity-check: weights load (strict=True)
+python fleet_review.py                        # all drives -> scores, review queue, chart
+python planner_eval.py                        # learned planner vs the car's real motion
+python fleet_review.py --from-csv --notes qwen3:8b   # + review notes from a local Ollama model
+python safety_report.py --scene 3             # one drive -> PDF safety report
+python risk_monitor.py                        # annotated risk video over a sequence
+python demo/make_demo.py                      # rebuild every GIF, image and the walkthrough video
+streamlit run app.py                          # interactive app: detection, trajectory, dashboard
+python trajectory_model.py                    # sanity check: weights load with strict=True
 ```
 
-Weights are tracked with **Git LFS**; nuScenes data is downloaded separately (the free **mini** split is enough). See [`docs/PUSH_TO_GITHUB.md`](docs/PUSH_TO_GITHUB.md).
-
----
+Weights are tracked with Git LFS. nuScenes data is downloaded separately from nuscenes.org.
 
 ## Repo map
 
 ```
-app.py                 Streamlit demo (detection · trajectory · scene dashboard)
-trajectory_model.py    BEV planner architecture (encoder + 4 heads)
-collision_risk.py      perception+planning fusion → CLEAR/CAUTION/BRAKE  (pure NumPy)
-scene_dashboard.py     camera+BEV dashboard, GIF builder, timestamp sync
-risk_monitor.py        sequence → annotated risk video
-safety_report.py       sequence → per-scene PDF safety report
-run_inference.py       one-command batch inference (yolo · named · bev · all)
-data_preparation_v2.py nuScenes → BEV + ego-trajectory pipeline
-vlm_reasoner.py        VLM reasoning layer (Ollama backend, multi-image, parsing)
-vlm_analyze.py         6-camera surround + BEV → VLM → reasoning card
-scene_narrator.py      pick scenes → VLM narrates each over surround+BEV → subtitled clips
-train_trajectory_v3.py BEV training (augmentation + diversity loss)
-docs/                  technical report + push guide
-assets/                result images & demo GIFs
-demo/                  narrated walkthrough video
+fleet_review.py        all drives -> per-drive score, ranked BRAKE moments, review time, notes
+planner_eval.py        learned planner vs real motion recovered from the LiDAR
+safety_report.py       one drive -> PDF safety report
+collision_risk.py      frames, obstacle map, LiDAR odometry, lane check -> CLEAR / CAUTION / BRAKE
+trajectory_model.py    BEV planner architecture (encoder + heads)
+train_trajectory_v3.py planner training (augmentation, diversity loss)
+data_preparation_v2.py nuScenes -> BEV rasters + ground-truth future paths
+risk_monitor.py        sequence -> annotated risk video
+scene_dashboard.py     scene splitting, timestamp sync, dashboard frames
+vlm_reasoner.py        language / vision-language layer (Ollama backend, prompts, JSON parsing)
+vlm_analyze.py         surround cameras + BEV -> reasoning card
+scene_narrator.py      per-scene narration (needs a vision model and synced cameras)
+app.py                 Streamlit app
+run_inference.py       batch inference (yolo, named, bev)
+demo/make_demo.py      rebuilds the demo GIFs, report images and walkthrough video
+docs/                  technical report
 ```
 
----
-
-## Engineering skills demonstrated
-
-End-to-end ownership of a **multi-sensor (camera + LiDAR) perception/planning stack**; custom **multi-task PyTorch model** (multi-modal regression + classification + confidence + segmentation); **motion-forecasting** fundamentals (ADE/FDE); **cloud training** on AWS SageMaker against a 200 GB dataset; **sensor fusion into a risk decision**; **productionisation** (Streamlit, one-command inference, Git LFS); and **reverse-engineering a model from its weights** to recover a lost architecture. It also integrates a **local VLM (Qwen2.5-VL via Ollama)** for open-vocabulary scene reasoning and neuro-symbolic corroboration of the safety decision.
-
----
-
 ## What's next
-1. Resume BEV training past epoch 5 to break the straight-line collapse and lower FDE.
-2. Multi-class YOLO on GPU (the curves show it was still improving).
-3. Project camera detections into the BEV frame so both sensors feed one obstacle map (calibration hook already stubbed in `scene_dashboard.py`).
-4. Latency profiling + ONNX/TensorRT export for an embedded target.
 
----
+1. Retrain the planner with the fixes listed in the technical report (mirror the lateral axis, logits
+   in the mode loss, a scene-level validation split), then switch the lane check to the learned path
+   once `planner_eval.py` shows it beats the heading baseline.
+2. Train the detector multi-class on a GPU and project its boxes into the BEV once the camera
+   calibration is wired in, so both sensors feed one obstacle map.
+3. Track obstacles over time so TTC uses the closing speed, not only the car's own speed.
+4. Run the vision-language path on synchronised cameras and score its hazard calls against nuScenes
+   labels (construction zones, emergency vehicles, pedestrians).
+5. Latency profiling and ONNX/TensorRT export for an embedded target.
 
-<p align="center"><em>Built with PyTorch · Ultralytics YOLOv8 · nuScenes · AWS SageMaker · Streamlit</em></p>
+## Changelog
+
+- **November 2026 review** (details in the [technical report](docs/Technical_Report.md#85-corrections-made-in-november-2026)).
+  - The risk layer looked up the path in the LiDAR raster without converting frames, so it searched
+    to the right of the car instead of ahead. It now converts frames, checked against the data.
+  - The obstacle height test only counted things more than about 2.1 m above the road, so most cars
+    and pedestrians were missed. It is now 0.5 m above the road.
+  - The planner was evaluated against the car's real motion: its sideways prediction is worse than
+    "keep the heading", traced to the mirror augmentation flipping the forward axis. The risk check
+    now follows the measured heading, and speed is measured from the LiDAR instead of inferred.
+  - Close gaps while stopped or crawling (lights, queues) no longer count as close calls.
+  - Speed and time-to-collision used a 10 s horizon instead of the 5.5 s the planner was trained on.
+  - Distances are now gaps from the front bumper, and the car's own LiDAR returns are masked.
+  - Scene splitting merged two recordings.
+  - Added `fleet_review.py`, per-scene safety reports and `demo/make_demo.py`. Every demo is rebuilt
+    from the model's predicted path. Demo clips produced by the offline stub instead of a real
+    model were removed.
+  - The BEV rasteriser is vectorised (about 17× faster, bit-identical output).

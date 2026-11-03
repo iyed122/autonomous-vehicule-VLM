@@ -7,7 +7,7 @@ __pycache__/
 venv/
 env/
 
-# ---- Large datasets (NOT pushed — see docs/PUSH_TO_GITHUB.md) ----
+# ---- Large datasets (NOT pushed) ----
 # nuScenes raw sensor data is hundreds of GB; keep it out of git.
 LIDAR_TOP/
 yolo_dataset/images/

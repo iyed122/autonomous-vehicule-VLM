@@ -29,14 +29,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from collision_risk import (RiskConfig, assess_risk, obstacle_map,
-                            straight_fallback_path, LEVEL_COLORS)
+                            straight_fallback_path, LEVEL_COLORS, PRED_HORIZON_S,
+                            bev_for_display, obstacle_points_ego)
 from data_preparation_v2 import load_lidar_points, create_bev_representation
 
 ROOT = Path(__file__).resolve().parent
 LIDAR_DIR = ROOT / "LIDAR_TOP"
 OUT = ROOT / "inference_outputs"
 BEV_WEIGHTS = ROOT / "checkpoint_v3" / "best_trajectory_model.pth"
-KEYFRAME_DT = 0.5  # nuScenes key-frame spacing (s) -> horizon = n_waypoints * dt
 
 
 def load_planner():
@@ -58,41 +58,42 @@ def predict_path(model, device, bev):
     return best[0].cpu().numpy()
 
 
-def render_frame(bev, path, occ, risk, idx, n):
+def render_frame(bev, path, occ, risk, idx, n, path_label="Predicted path", corridor_m=None,
+                 view=(-50, 50, -50, 50)):
     fig, ax = plt.subplots(figsize=(7.5, 7.5), dpi=110)
-    ax.imshow(bev[:, :, 2], cmap="gray", origin="lower",
-              extent=[-50, 50, -50, 50], alpha=0.85)
-    # obstacle cells (downsampled scatter for speed)
-    ys, xs = np.where(occ)
-    if len(xs):
-        mx = xs * 0.2 - 50.0   # NOTE: col index -> y(left); row index -> x(fwd)
-        my = ys * 0.2 - 50.0
-        ax.scatter(my, mx, s=1, c="#c0392b", alpha=0.25)
+    img, extent = bev_for_display(bev[:, :, 2])
+    ax.imshow(img, cmap="gray", origin="lower", extent=extent, alpha=0.85)
+    # obstacle cells, converted from the LiDAR frame to the ego frame
+    ox, oy = obstacle_points_ego(occ)
+    if len(ox):
+        ax.scatter(ox, oy, s=2, c="#ff5a4a", alpha=0.6)
     # predicted path
-    ax.plot(path[:, 0], path[:, 1], color="#3498db", lw=3, label="Predicted path")
+    if corridor_m:
+        ax.fill_between(path[:, 0], path[:, 1] - corridor_m, path[:, 1] + corridor_m,
+                        color="#3498db", alpha=0.45, lw=0)
+    ax.plot(path[:, 0], path[:, 1], color="#3498db", lw=3, label=path_label)
     ax.scatter([0], [0], c="cyan", marker="*", s=240, edgecolors="k",
                zorder=6, label="Ego")
     if risk.hit_point_m is not None:
         ax.scatter([risk.hit_point_m[0]], [risk.hit_point_m[1]], s=220,
                    facecolors="none", edgecolors=LEVEL_COLORS[risk.level],
                    linewidths=3, zorder=7, label="Nearest obstacle")
-    ax.set_xlim(-50, 50); ax.set_ylim(-50, 50); ax.set_aspect("equal")
+    ax.set_xlim(view[0], view[1]); ax.set_ylim(view[2], view[3]); ax.set_aspect("equal")
     ax.set_xlabel("X (m) forward"); ax.set_ylabel("Y (m) left")
     ax.grid(alpha=0.25); ax.legend(loc="lower right", fontsize=8)
 
     # risk banner
     color = LEVEL_COLORS[risk.level]
-    dist = "clear" if not np.isfinite(risk.nearest_dist_m) else f"{risk.nearest_dist_m:.1f} m"
+    dist = "clear" if not np.isfinite(risk.nearest_dist_m) else f"{risk.nearest_dist_m:.1f} m ahead of bumper"
     ttc = f"{risk.ttc_s:.1f} s" if risk.ttc_s else "—"
-    spd = f"{risk.speed_mps*3.6:.0f} km/h" if risk.speed_mps else "—"
+    spd = f"{risk.speed_mps*3.6:.0f} km/h" if risk.speed_mps is not None else "—"
     ax.text(0.5, 1.14, f"{risk.level}", transform=ax.transAxes, ha="center",
             va="center", fontsize=22, fontweight="bold", color="white",
             bbox=dict(boxstyle="round,pad=0.4", fc=color, ec="none"))
     ax.text(0.5, 1.05, f"obstacle in path: {dist}   ·   TTC: {ttc}   ·   ego: {spd}",
             transform=ax.transAxes, ha="center", va="center", fontsize=10)
-    ax.text(0.01, 1.05, f"frame {idx+1}/{n}", transform=ax.transAxes, ha="left",
-            va="center", fontsize=9, color="#888")
-    fig.suptitle("Collision-risk monitor", fontsize=9, color="#888", y=0.995)
+    ax.text(0.01, 0.01, f"frame {idx+1}/{n}", transform=ax.transAxes, ha="left",
+            va="bottom", fontsize=9, color="#bbb")
     fig.subplots_adjust(top=0.86)
     fig.canvas.draw()
     buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
@@ -134,7 +135,7 @@ def main():
     frames = sorted(LIDAR_DIR.glob("*.bin"))[:args.frames * args.stride:args.stride]
     if not frames:
         raise FileNotFoundError(f"No .bin frames in {LIDAR_DIR}")
-    horizon = 20 * KEYFRAME_DT
+    horizon = PRED_HORIZON_S
 
     model = device = None
     if not args.straight:

@@ -10,22 +10,32 @@ something, and how urgently should I react?*
 
 This module is pure NumPy (no torch), so the risk logic can be unit-tested and
 run anywhere. It is consumed by:
-  * app.py          (live single-frame risk in the demo)
-  * risk_monitor.py (annotated video over a driving sequence)
-  * safety_report.py(batch safety report)
+  * app.py           (live single-frame risk in the demo)
+  * risk_monitor.py  (annotated video over a driving sequence)
+  * safety_report.py (per-scene safety report)
+  * fleet_review.py  (every scene, review queue)
+
+Two coordinate frames
+---------------------
+* The planner predicts waypoints in the **ego frame**: x forward, y left, origin at
+  the rear axle (how nuScenes defines ego poses).
+* The BEV raster is built from LIDAR_TOP points in the **sensor frame**: x to the
+  right, y forward, origin at the roof LiDAR. Raster axis 0 is sensor x, axis 1 is
+  sensor y.
+`ego_to_sensor` / `sensor_to_ego` convert between them; every lookup into the raster
+and every plot goes through them. (Until November 2026 the corridor scan indexed the
+raster with ego coordinates directly, i.e. it searched to the right of the car.)
 
 Method
 ------
-1. Obstacle map: a BEV cell counts as an obstacle if it is both *dense* (enough
-   LiDAR returns) and *elevated* (max height clearly above the road surface).
-   The height test removes flat ground returns, which a raw density map keeps.
-2. Ego deadzone: returns within `EGO_DEADZONE_M` of the origin are the vehicle's
-   own body / immediate ground and are ignored (standard in real sensor stacks).
-3. Corridor scan: walk along the predicted path; at each waypoint test a
-   half-vehicle-width corridor against the obstacle map. The first hit is the
-   nearest in-path obstacle.
-4. Decision: map nearest-obstacle distance to BRAKE / CAUTION / CLEAR, and (if a
-   speed is available) to a time-to-obstacle.
+1. Obstacle map: a BEV cell counts as an obstacle if it is *dense* (enough LiDAR
+   returns) and *tall*: its highest return is at least `min_obstacle_height_m`
+   above the road (the road sits `sensor_height_m` below the LiDAR).
+2. Corridor scan: walk along the predicted path from the front bumper outward; at
+   each point test a vehicle-wide corridor against the obstacle map. The first hit
+   is the nearest in-path obstacle; its distance is the gap to the front bumper.
+3. Decision: gap below `brake_dist_m` -> BRAKE, below `caution_dist_m` -> CAUTION,
+   else CLEAR, plus a time-to-obstacle when a speed is available.
 
 All thresholds live in `RiskConfig` so they are explicit and tunable.
 """
@@ -38,41 +48,85 @@ import numpy as np
 
 @dataclass
 class RiskConfig:
-    x_range: Tuple[float, float] = (-50.0, 50.0)
-    y_range: Tuple[float, float] = (-50.0, 50.0)
-    resolution: float = 0.2          # metres / cell  (matches data_preparation_v2)
-    corridor_half_width_m: float = 1.0   # half the ego vehicle width
-    ego_deadzone_m: float = 3.0          # ignore the vehicle's own returns
-    density_thresh: float = 0.2          # normalised density (>= ~2 returns/cell)
-    height_thresh: float = 0.55          # normalised height; >road surface
-    brake_dist_m: float = 8.0            # nearest obstacle below this -> BRAKE
-    caution_dist_m: float = 20.0         # below this -> CAUTION, else CLEAR
-    scan_samples: int = 90               # densify the path before scanning
+    x_range: Tuple[float, float] = (-50.0, 50.0)   # raster extent, sensor x (right)
+    y_range: Tuple[float, float] = (-50.0, 50.0)   # raster extent, sensor y (forward)
+    resolution: float = 0.2              # metres / cell  (matches data_preparation_v2)
+    corridor_half_width_m: float = 1.0   # half the ego vehicle width, plus a margin
+    front_bumper_m: float = 3.4          # front bumper, metres ahead of the rear axle
+    rear_bumper_m: float = -0.9          # rear bumper (negative: behind the rear axle)
+    body_half_width_m: float = 1.0       # half the car's width, plus a margin
+    density_thresh: float = 0.2          # normalised density (more than 2 returns/cell)
+    sensor_height_m: float = 1.84        # LIDAR_TOP sits ~1.84 m above the road
+    min_obstacle_height_m: float = 0.5   # highest return at least this far above the road
+    brake_dist_m: float = 5.0            # gap from the front bumper below this -> BRAKE
+    caution_dist_m: float = 15.0         # below this -> CAUTION, else CLEAR
+    scan_samples: int = 120              # densify the path before scanning
 
+
+BEV_Z_RANGE = (-3.0, 3.0)   # z window of create_bev_representation (sensor frame, metres)
+LIDAR_X_OFFSET_M = 0.94     # LIDAR_TOP is ~0.94 m ahead of the ego origin (rear axle)
 
 LEVELS = {"CLEAR": 0, "CAUTION": 1, "BRAKE": 2}
 LEVEL_COLORS = {"CLEAR": "#2ecc71", "CAUTION": "#f39c12", "BRAKE": "#e74c3c"}
+
+# Time between the planner's first and last waypoint. Training targets are the ego
+# positions of the next 12 nuScenes key-frames (2 Hz, i.e. 0.5 s to 6.0 s ahead),
+# resampled to 20 points, so the 20 waypoints span 5.5 s. Speed and time-to-obstacle
+# are derived from it, so every caller should pass this value.
+PRED_HORIZON_S = 5.5
 
 
 @dataclass
 class RiskResult:
     level: str                       # CLEAR / CAUTION / BRAKE
-    nearest_dist_m: float            # inf if path is clear
+    nearest_dist_m: float            # gap from the front bumper; inf if path is clear
     ttc_s: Optional[float]           # time-to-obstacle, if speed known
     hit_point_m: Optional[Tuple[float, float]]  # obstacle location (ego frame)
     speed_mps: Optional[float]
+
+
+def ego_to_sensor(px, py):
+    """Ego frame (x forward, y left, rear axle) -> LIDAR_TOP frame (x right, y forward)."""
+    return -np.asarray(py), np.asarray(px) - LIDAR_X_OFFSET_M
+
+
+def sensor_to_ego(sx, sy):
+    """LIDAR_TOP frame (x right, y forward) -> ego frame (x forward, y left, rear axle)."""
+    return np.asarray(sy) + LIDAR_X_OFFSET_M, -np.asarray(sx)
+
+
+def bev_for_display(channel: np.ndarray, cfg: RiskConfig = RiskConfig()):
+    """(image, extent) to `imshow(image, origin="lower", extent=extent)` one BEV channel
+    in ego-frame axes: x forward to the right of the plot, y left towards the top."""
+    extent = [cfg.y_range[0] + LIDAR_X_OFFSET_M, cfg.y_range[1] + LIDAR_X_OFFSET_M,
+              -cfg.x_range[1], -cfg.x_range[0]]
+    return channel[::-1, :], extent
+
+
+def obstacle_points_ego(occ: np.ndarray, cfg: RiskConfig = RiskConfig()):
+    """Cell centres of an obstacle grid, in ego-frame metres (x forward, y left)."""
+    gx, gy = np.where(occ)
+    sx = cfg.x_range[0] + (gx + 0.5) * cfg.resolution
+    sy = cfg.y_range[0] + (gy + 0.5) * cfg.resolution
+    return sensor_to_ego(sx, sy)
 
 
 def obstacle_map(bev: np.ndarray, cfg: RiskConfig = RiskConfig()) -> np.ndarray:
     """Boolean obstacle grid from a (H, W, 3) BEV raster (height/intensity/density)."""
     height = bev[:, :, 0]
     density = bev[:, :, 2]
-    return (density > cfg.density_thresh) & (height > cfg.height_thresh)
+    # The height channel is (z - z_min) / (z_max - z_min) in the sensor frame, where the
+    # road sits at z = -sensor_height. Convert "0.5 m above the road" into that scale.
+    z_min, z_max = BEV_Z_RANGE
+    thresh = (cfg.min_obstacle_height_m - cfg.sensor_height_m - z_min) / (z_max - z_min)
+    return (density > cfg.density_thresh) & (height > thresh)
 
 
 def _m_to_grid(px: float, py: float, cfg: RiskConfig):
-    gx = int((px - cfg.x_range[0]) / cfg.resolution)
-    gy = int((py - cfg.y_range[0]) / cfg.resolution)
+    """Ego-frame metres -> raster indices (axis 0 = sensor x, axis 1 = sensor y)."""
+    sx, sy = ego_to_sensor(px, py)
+    gx = int(np.floor((sx - cfg.x_range[0]) / cfg.resolution))
+    gy = int(np.floor((sy - cfg.y_range[0]) / cfg.resolution))
     return gx, gy
 
 
@@ -90,8 +144,8 @@ def _densify(path: np.ndarray, n: int) -> np.ndarray:
 
 
 def estimate_speed_mps(path: np.ndarray, horizon_s: float) -> Optional[float]:
-    """Crude ego speed = path length / horizon. `horizon_s` = seconds the
-    predicted waypoints span (nuScenes key-frames are 0.5 s apart)."""
+    """Crude ego speed = path length / horizon. `horizon_s` = seconds between the
+    first and last waypoint (PRED_HORIZON_S for the trained planner)."""
     if len(path) < 2 or horizon_s <= 0:
         return None
     length = float(np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1)))
@@ -101,34 +155,51 @@ def estimate_speed_mps(path: np.ndarray, horizon_s: float) -> Optional[float]:
 def assess_risk(path_xy: np.ndarray,
                 bev: np.ndarray,
                 cfg: RiskConfig = RiskConfig(),
-                horizon_s: float = 4.0) -> RiskResult:
-    """Fuse a predicted path with the BEV obstacle map into a risk decision.
+                horizon_s: float = PRED_HORIZON_S,
+                speed_mps: Optional[float] = None) -> RiskResult:
+    """Fuse a path with the BEV obstacle map into a risk decision.
 
     Args:
-        path_xy : (N, 2) predicted ego waypoints in metres (x forward, y left).
+        path_xy : (N, 2) ego waypoints in metres (x forward, y left): the learned path,
+                  or heading_corridor().
         bev     : (H, W, 3) BEV raster from create_bev_representation.
-        horizon_s: time the waypoints span, for the speed/TTC estimate.
+        horizon_s: time the waypoints span, for the path-based speed estimate.
+        speed_mps: measured speed (e.g. lidar_odometry); if given, it replaces the
+                  path-based estimate for TTC.
     """
     occ = obstacle_map(bev, cfg)
     H, W = occ.shape
+    # The roof LiDAR also sees the car itself: drop returns inside its own footprint.
+    gx0, gy0 = _m_to_grid(cfg.front_bumper_m, cfg.body_half_width_m, cfg)
+    gx1, gy1 = _m_to_grid(cfg.rear_bumper_m, -cfg.body_half_width_m, cfg)
+    occ = occ.copy()
+    occ[min(gx0, gx1):max(gx0, gx1) + 1, min(gy0, gy1):max(gy0, gy1) + 1] = False
     hw = max(1, int(cfg.corridor_half_width_m / cfg.resolution))
 
-    path = _densify(np.asarray(path_xy, dtype=float), cfg.scan_samples)
-    speed = estimate_speed_mps(path, horizon_s)
+    path = np.asarray(path_xy, dtype=float)
+    speed = speed_mps if speed_mps is not None else estimate_speed_mps(path, horizon_s)
+    # The first waypoint is already 0.5 s ahead: scan from the car itself.
+    path = _densify(np.vstack([[0.0, 0.0], path]), cfg.scan_samples)
 
     nearest = np.inf
     hit_point = None
     for px, py in path:
-        r = float(np.hypot(px, py))
-        if r < cfg.ego_deadzone_m:
+        if px < cfg.front_bumper_m:          # still inside the car's own footprint
             continue
         gx, gy = _m_to_grid(px, py, cfg)
         if not (0 <= gx < H and 0 <= gy < W):
             continue
-        win = occ[max(0, gx - hw):gx + hw + 1, max(0, gy - hw):gy + hw + 1]
+        x0, y0 = max(0, gx - hw), max(0, gy - hw)
+        win = occ[x0:gx + hw + 1, y0:gy + hw + 1]
         if win.size and win.any():
-            nearest = r
-            hit_point = (px, py)
+            # Measure to the obstacle cells themselves, not to the path point whose
+            # window touched them (that would read up to one window short).
+            wx, wy = np.where(win)
+            cx, cy = sensor_to_ego(cfg.x_range[0] + (x0 + wx + 0.5) * cfg.resolution,
+                                   cfg.y_range[0] + (y0 + wy + 0.5) * cfg.resolution)
+            k = int(np.argmin(np.hypot(cx, cy)))
+            nearest = max(0.0, float(np.hypot(cx[k], cy[k])) - cfg.front_bumper_m)
+            hit_point = (float(cx[k]), float(cy[k]))
             break
 
     if nearest < cfg.brake_dist_m:
@@ -148,10 +219,72 @@ def straight_fallback_path(length_m: float = 30.0, n: int = 20) -> np.ndarray:
     return np.stack([np.linspace(0, length_m, n), np.zeros(n)], axis=1)
 
 
+MOVING_MPS = 2.0   # ~7 km/h: below this a close gap is a queue or a stop, not a close call
+
+
+def effective_level(level: str, speed_mps: Optional[float]) -> str:
+    """Risk level that counts for scoring and review: a close gap while stopped or crawling
+    (traffic light, queue) is not a close call. Unknown speed keeps the level."""
+    if speed_mps is not None and speed_mps < MOVING_MPS:
+        return "CLEAR"
+    return level
+
+
+def heading_corridor(speed_mps: Optional[float], cfg: RiskConfig = RiskConfig(),
+                     horizon_s: float = PRED_HORIZON_S) -> np.ndarray:
+    """The path along the car's current heading that the risk check scans: as far as the
+    car travels in `horizon_s` at `speed_mps`, and never shorter than the CAUTION range.
+    Used instead of the learned path while the epoch-5 planner's sideways prediction is
+    worse than this baseline (see planner_eval.py)."""
+    reach = cfg.front_bumper_m + cfg.caution_dist_m + 1.0
+    length = max(reach, (speed_mps or 0.0) * horizon_s + cfg.front_bumper_m)
+    return straight_fallback_path(length, 20)
+
+
+def _registration_grid(bev: np.ndarray, cfg: RiskConfig = RiskConfig()) -> np.ndarray:
+    """Static-structure occupancy used to align two scans: dense cells 0.3 m+ above road."""
+    z_min, z_max = BEV_Z_RANGE
+    thresh = (0.3 - cfg.sensor_height_m - z_min) / (z_max - z_min)
+    return ((bev[:, :, 2] > cfg.density_thresh) & (bev[:, :, 0] > thresh)).astype(np.float32)
+
+
+def scan_motion(bev_prev: np.ndarray, bev_next: np.ndarray, cfg: RiskConfig = RiskConfig()):
+    """How far the car moved between two scans, in the ego frame of the first one.
+
+    Cross-correlates the two occupancy grids (FFT); the peak is the shift of the static
+    world between the scans, i.e. the car's own motion (translation only, so it is most
+    accurate over short gaps). Returns (forward_m, left_m, quality in [0, 1])."""
+    a, b = _registration_grid(bev_prev, cfg), _registration_grid(bev_next, cfg)
+    if a.sum() < 50 or b.sum() < 50:
+        return 0.0, 0.0, 0.0
+    corr = np.real(np.fft.ifft2(np.fft.fft2(a) * np.conj(np.fft.fft2(b))))
+    k0, k1 = np.unravel_index(int(np.argmax(corr)), corr.shape)
+    n0, n1 = corr.shape
+    d0 = ((k0 + n0 // 2) % n0 - n0 // 2) * cfg.resolution     # sensor x (right) shift
+    d1 = ((k1 + n1 // 2) % n1 - n1 // 2) * cfg.resolution     # sensor y (forward) shift
+    quality = float(corr.max() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-9))
+    return float(d1), float(-d0), quality
+
+
+def lidar_odometry(bev_prev: np.ndarray, bev_next: np.ndarray, dt_s: float,
+                   cfg: RiskConfig = RiskConfig(), min_quality: float = 0.15):
+    """Measured ego speed from two consecutive scans, no model involved.
+    Returns (speed_mps, quality), or (None, quality) when the alignment is too weak."""
+    fwd, left, quality = scan_motion(bev_prev, bev_next, cfg)
+    if quality < min_quality:
+        return None, quality
+    return float(np.hypot(fwd, left)) / dt_s, quality
+
+
 if __name__ == "__main__":
-    # Self-test on a real bundled LiDAR frame (no torch needed).
+    # Self-test on real bundled LiDAR frames (no torch needed).
     import glob
     from data_preparation_v2 import load_lidar_points, create_bev_representation
+
+    # Frame convention: ego (10 m ahead, 2 m left) is sensor (-2 m, 9.06 m) and back.
+    sx, sy = ego_to_sensor(10.0, 2.0)
+    assert np.allclose([sx, sy], [-2.0, 10.0 - LIDAR_X_OFFSET_M])
+    assert np.allclose(sensor_to_ego(sx, sy), [10.0, 2.0])
 
     cfg = RiskConfig()
     frames = sorted(glob.glob("LIDAR_TOP/*.bin"))[:5]
@@ -160,4 +293,4 @@ if __name__ == "__main__":
         res = assess_risk(straight_fallback_path(45, 30), bev, cfg)
         ttc = f"{res.ttc_s:.1f}s" if res.ttc_s else "n/a"
         d = f"{res.nearest_dist_m:.1f}m" if np.isfinite(res.nearest_dist_m) else "clear"
-        print(f"{f.split('/')[-1][:40]:40s}  {res.level:8s} nearest={d:8s} ttc={ttc}")
+        print(f"{f.split('/')[-1][:40]:40s}  {res.level:8s} gap={d:8s} ttc={ttc}")

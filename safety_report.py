@@ -13,9 +13,9 @@ It quantifies, for a scene:
   * a one-line scene safety score.
 
 Usage:
-    python safety_report.py                      # first 200 frames
-    python safety_report.py --frames 400 --stride 2
-    python safety_report.py --straight           # baseline path, no torch needed
+    python safety_report.py                      # first scene in LIDAR_TOP/
+    python safety_report.py --scene 12           # any scene (0-based, see fleet_review.py)
+    python safety_report.py --path model         # scan along the learned path instead
 
 Output: inference_outputs/safety_report.pdf
 """
@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
 from collision_risk import (RiskConfig, assess_risk, straight_fallback_path,
-                            LEVELS, LEVEL_COLORS)
+                            LEVELS, LEVEL_COLORS, PRED_HORIZON_S)
 from data_preparation_v2 import load_lidar_points, create_bev_representation
 
 ROOT = Path(__file__).resolve().parent
@@ -83,6 +83,12 @@ def find_events(levels, dists, ttcs, dt):
     return events
 
 
+def safety_score(pct, n_brake_events):
+    """Simple 0-100 safety score: penalise time-at-risk and proximity."""
+    return max(0.0, 100.0 - pct["CAUTION"] * 0.5 - pct["BRAKE"] * 1.5
+               - n_brake_events * 2.0)
+
+
 def build_report(levels, dists, ttcs, speeds, dt, scene_name, n_frames, mode):
     counts = {k: levels.count(k) for k in LEVELS}
     pct = {k: 100.0 * counts[k] / max(1, len(levels)) for k in LEVELS}
@@ -90,9 +96,7 @@ def build_report(levels, dists, ttcs, speeds, dt, scene_name, n_frames, mode):
     brake_events = [e for e in events if e["peak"] == "BRAKE"]
     finite_d = np.array([d for d in dists if np.isfinite(d)])
     min_dist = finite_d.min() if len(finite_d) else float("nan")
-    # Simple 0-100 safety score: penalise time-at-risk and proximity.
-    score = max(0.0, 100.0 - pct["CAUTION"] * 0.5 - pct["BRAKE"] * 1.5
-                - len(brake_events) * 2.0)
+    score = safety_score(pct, len(brake_events))
 
     pp = PdfPages(str(OUT / "safety_report.pdf"))
 
@@ -109,7 +113,7 @@ def build_report(levels, dists, ttcs, speeds, dt, scene_name, n_frames, mode):
     lines = [
         f"Scene             : {scene_name}",
         f"Frames analysed   : {n_frames}  (~{n_frames*dt:.0f} s at {1/dt:.0f} Hz key-frames)",
-        f"Path source       : {'trajectory planner (BEV model)' if mode!='straight' else 'constant-velocity baseline'}",
+        f"Path checked      : {'learned planner path' if mode == 'model' else 'current heading, LiDAR-measured speed'}",
         "",
         f"Time CLEAR        : {pct['CLEAR']:.0f}%   ({counts['CLEAR']} frames)",
         f"Time CAUTION      : {pct['CAUTION']:.0f}%   ({counts['CAUTION']} frames)",
@@ -159,13 +163,13 @@ def build_report(levels, dists, ttcs, speeds, dt, scene_name, n_frames, mode):
     axes[1].plot(t, d_plot, color="#c0392b")
     axes[1].axhline(RiskConfig().brake_dist_m, ls="--", c="#e74c3c", label="BRAKE thresh")
     axes[1].axhline(RiskConfig().caution_dist_m, ls="--", c="#f39c12", label="CAUTION thresh")
-    axes[1].set_ylabel("nearest obstacle (m)"); axes[1].set_title("Obstacle distance in path")
+    axes[1].set_ylabel("gap to obstacle (m)"); axes[1].set_title("Obstacle in path: gap from the front bumper")
     axes[1].legend(fontsize=8); axes[1].grid(alpha=0.3)
 
     sp = [s * 3.6 if s else np.nan for s in speeds]
     axes[2].plot(t, sp, color="#2980b9")
     axes[2].set_ylabel("speed (km/h)"); axes[2].set_xlabel("time (s)")
-    axes[2].set_title("Estimated ego speed"); axes[2].grid(alpha=0.3)
+    axes[2].set_title("Speed measured from the LiDAR (scan alignment)"); axes[2].grid(alpha=0.3)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     pp.savefig(fig); plt.close(fig)
     pp.close()
@@ -175,39 +179,37 @@ def build_report(levels, dists, ttcs, speeds, dt, scene_name, n_frames, mode):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--frames", type=int, default=200)
+    ap.add_argument("--scene", type=int, default=0,
+                    help="which continuous scene to report on (0-based)")
     ap.add_argument("--stride", type=int, default=1)
-    ap.add_argument("--straight", action="store_true")
+    ap.add_argument("--path", choices=["heading", "model"], default="heading",
+                    help="scan along the car's heading (default) or the learned path")
     args = ap.parse_args()
 
+    from scene_dashboard import group_scenes
+    from fleet_review import assess_scene
+    from collision_risk import effective_level
     OUT.mkdir(exist_ok=True)
-    cfg = RiskConfig()
-    frames = sorted(LIDAR_DIR.glob("*.bin"))[:args.frames * args.stride:args.stride]
-    if not frames:
+    all_frames = sorted(LIDAR_DIR.glob("*.bin"))
+    if not all_frames:
         raise FileNotFoundError(f"No .bin frames in {LIDAR_DIR}")
-    scene_name = frames[0].name.split("__")[0]
-    horizon = 20 * KEYFRAME_DT
+    scenes = group_scenes(all_frames)
+    start, end = scenes[args.scene]
+    frames = all_frames[start:end:args.stride]
+    scene_name = f"{frames[0].name.split('__')[0]}  (scene {args.scene} of {len(scenes)})"
     dt = KEYFRAME_DT * args.stride
 
     model = device = None
-    if not args.straight:
+    if args.path == "model":
         model, device = load_planner()
-        print(f"Loaded planner on {device}")
-
-    levels, dists, ttcs, speeds = [], [], [], []
-    for i, f in enumerate(frames):
-        bev = create_bev_representation(load_lidar_points(str(f)))
-        path = (straight_fallback_path(30, 20) if args.straight
-                else predict_path(model, device, bev))
-        r = assess_risk(path, bev, cfg, horizon_s=horizon)
-        levels.append(r.level); dists.append(r.nearest_dist_m)
-        ttcs.append(r.ttc_s); speeds.append(r.speed_mps)
-        if (i + 1) % 25 == 0:
-            print(f"  {i+1}/{len(frames)} frames…")
+    results = assess_scene(frames, RiskConfig(), model, device, dt)
+    levels = [effective_level(r.level, sp) for _, _, r, sp in results]
+    dists = [r.nearest_dist_m for _, _, r, _ in results]
+    ttcs = [r.ttc_s for _, _, r, _ in results]
+    speeds = [sp for _, _, _, sp in results]
 
     score, counts, n_ev = build_report(levels, dists, ttcs, speeds, dt,
-                                        scene_name, len(frames),
-                                        "straight" if args.straight else "model")
+                                        scene_name, len(frames), args.path)
     print(f"\nSafety score {score:.0f}/100 · {counts} · {n_ev} risk events")
     print(f"Saved {OUT / 'safety_report.pdf'}")
 

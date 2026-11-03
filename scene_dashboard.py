@@ -31,7 +31,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from collision_risk import RiskConfig, obstacle_map, LEVEL_COLORS
+from collision_risk import (RiskConfig, obstacle_map, LEVEL_COLORS, bev_for_display,
+                            obstacle_points_ego)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -61,13 +62,11 @@ def render_dashboard_frame(bev, path, risk, idx, n,
         cam_ax.axis("off")
 
     # --- BEV panel ---
-    bev_ax.imshow(bev[:, :, 2], cmap="gray", origin="lower",
-                  extent=[-50, 50, -50, 50], alpha=0.85)
-    occ = obstacle_map(bev, cfg)
-    ys, xs = np.where(occ)
-    if len(xs):
-        bev_ax.scatter(xs * cfg.resolution - 50.0, ys * cfg.resolution - 50.0,
-                       s=1, c="#c0392b", alpha=0.22)
+    img, extent = bev_for_display(bev[:, :, 2], cfg)
+    bev_ax.imshow(img, cmap="gray", origin="lower", extent=extent, alpha=0.85)
+    ox, oy = obstacle_points_ego(obstacle_map(bev, cfg), cfg)
+    if len(ox):
+        bev_ax.scatter(ox, oy, s=1, c="#c0392b", alpha=0.22)
     bev_ax.plot(path[:, 0], path[:, 1], color="#3498db", lw=3, label="Predicted path")
     bev_ax.scatter([0], [0], c="cyan", marker="*", s=240, edgecolors="k",
                    zorder=6, label="Ego")
@@ -173,7 +172,7 @@ def group_scenes(files, gap_s=2.0):
         return [(0, len(files))]
     scenes, start = [], 0
     for i in range(1, len(files)):
-        if (ts[i] - ts[i - 1]) / 1e6 > gap_s:
+        if abs(ts[i] - ts[i - 1]) / 1e6 > gap_s:   # abs: a new log can start earlier in time
             scenes.append((start, i)); start = i
     scenes.append((start, len(files)))
     return scenes
